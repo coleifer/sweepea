@@ -1,4 +1,5 @@
 from cpython cimport datetime
+import hashlib
 import logging
 import operator
 import threading
@@ -150,6 +151,9 @@ class Database(object):
         cursor = self.cursor()
         cursor.execute(sql, params or ())
         return cursor
+
+    def execute(self, clause):
+        return self.execute_sql(*self.query_builder.build_query(clause))
 
     def last_insert_id(self, cursor):
         """
@@ -1750,7 +1754,7 @@ cdef class Field(Node):
         basestring column_name
         object default
         readonly basestring name, sort_key
-        readonly bint null, unique, primary_key
+        readonly bint null, index, unique, primary_key
         readonly Entity column
         readonly field_order
         readonly list constraints
@@ -1759,10 +1763,11 @@ cdef class Field(Node):
     field_type = ''
     node_type = 'field'
 
-    def __init__(self, null=False, unique=False, default=None, column=None,
-                 primary_key=False, constraints=None):
+    def __init__(self, null=False, index=False, unique=False, default=None,
+                 column=None, primary_key=False, constraints=None):
         global field_order
         self.null = null
+        self.index = index
         self.unique = unique
         self.default = default
         self.column_name = column
@@ -1794,6 +1799,40 @@ cdef class Field(Node):
 
     cdef coerce(self, value):
         return value
+
+    cdef Entity as_entity(self, bint with_table=False):
+        if with_table:
+            return self.column
+        return self.column.tail()
+
+    cdef basestring _ddl_column_type(self):
+        return self.field_type
+
+    cdef SQL _ddl_column(self):
+        cdef:
+            basestring column_type = self._ddl_column_type()
+            list modifiers
+
+        modifiers = self._ddl_modifiers()
+        if modifiers:
+            return SQL(
+                '%s(%s)' % (column_type, ', '.join(map(str, modifiers))))
+        return SQL(column_type)
+
+    cdef list _ddl_modifiers(self):
+        return None
+
+    cdef Clause ddl(self):
+        """Return a list of Node instances that defines the column."""
+        cdef list ddl
+        ddl = [self.as_entity(), self._ddl_column()]
+        if not self.null:
+            ddl.append(SQL('NOT NULL'))
+        if self.primary_key:
+            ddl.append(SQL('PRIMARY KEY'))
+        if self.constraints:
+            ddl.extend(self.constraints)
+        return Clause(ddl)
 
     def __richcmp__(self, rhs, operation):
         return Expression(self, comparison_map[operation], rhs)
@@ -1926,6 +1965,16 @@ cdef class ForeignKeyField(Field):
         if isinstance(value, Model):
             value = getattr(value, self.rel_field.name)
         return self.rel_field.db_value(value)
+
+    cdef basestring _ddl_column_type(self):
+        if not isinstance(self.rel_field, PrimaryKeyField):
+            return self.rel_field._ddl_column_type()
+        return PrimaryKeyField.field_type
+
+    cdef list _ddl_modifiers(self):
+        if not isinstance(self.rel_field, PrimaryKeyField):
+            return self.rel_field._ddl_modifiers()
+        return None
 
     cpdef bind(self, model, basestring name):
         self.column_name = self.column_name or name
@@ -2142,6 +2191,117 @@ cdef class Metadata(object):
             key=operator.attrgetter('sort_key'))
 
 
+cdef class ModelSchemaManager(object):
+    cdef:
+        object model
+
+    def __init__(self, model):
+        self.model = model
+
+    cdef Clause create_table(self, bint safe):
+        cdef:
+            list columns = [], constraints = [], parts = []
+            Field field, rel_field
+
+        parts.append(SQL(
+            'CREATE TABLE IF NOT EXISTS' if safe else 'CREATE TABLE'))
+        parts.append(self.model._meta.table)
+        for field in self.model._meta.sorted_fields:
+            columns.append(field.ddl())
+            if isinstance(field, ForeignKeyField):
+                rel_field = field.rel_field
+                constraints.append(Clause((
+                    SQL('FOREIGN KEY'),
+                    EnclosedClause((field.as_entity(),)),
+                    SQL('REFERENCES'),
+                    field.rel_model._meta.table,
+                    EnclosedClause((rel_field.as_entity(),)),
+                )))
+
+        parts.append(EnclosedClause(columns + constraints))
+        return Clause(parts)
+
+    cdef Clause drop_table(self, bint safe):
+        cdef list parts = []
+
+        parts.append(SQL('DROP TABLE IF EXISTS' if safe else 'DROP TABLE'))
+        parts.append(self.model._meta.table)
+        return Clause(parts)
+
+    cdef basestring index_name(self, list fields):
+        cdef:
+            basestring index_name = '%s_%s' % (
+                self.model._meta.name,
+                '_'.join([field.name for field in fields]))
+            basestring index_hash
+
+        if len(index_name) > 64:
+            index_hash = hashlib.md5(index_name.encode('utf-8')).hexdigest()
+            index_name = '%s_%s' % (self.model._meta.name, index_hash)
+
+        return index_name
+
+    cdef list create_indexes(self, bint safe):
+        cdef:
+            Field field
+            list indexes = []
+
+        for field in self.model._meta.sorted_fields:
+            if field.index or field.unique:
+                indexes.append(self.create_index(
+                    [field],
+                    field.unique,
+                    safe))
+
+        return indexes
+
+    cdef Clause create_index(self, list fields, bint unique, bint safe):
+        cdef:
+            basestring sql = ('CREATE UNIQUE INDEX'
+                              if unique else 'CREATE INDEX')
+            Field field
+            list parts = []
+
+        if safe:
+            sql += ' IF NOT EXISTS'
+        parts.append(SQL(sql))
+        parts.append(Entity((self.index_name(fields),)))
+        parts.append(SQL('ON'))
+        parts.append(self.model._meta.table)
+        parts.append(EnclosedClause([field.as_entity() for field in fields]))
+        return Clause(parts)
+
+    cdef list drop_indexes(self, bint safe):
+        cdef:
+            Field field
+            list indexes = []
+
+        for field in self.model._meta.sorted_fields:
+            if field.index or field.unique:
+                indexes.append(Clause((
+                    SQL('DROP INDEX IF EXISTS' if safe else 'DROP INDEX'),
+                    Entity((self.index_name([field]),)),
+                )))
+
+        return indexes
+
+    cdef create_all(self, safe=True):
+        db = self.model._meta.database
+        create_table_clause = self.create_table(safe)
+        db.execute(create_table_clause)
+
+        for clause in self.create_indexes(safe):
+            db.execute(clause)
+
+    cdef drop_all(self, safe=True):
+        db = self.model._meta.database
+        drop_table_clause = self.drop_table(safe)
+        db.execute(drop_table_clause)
+
+        for clause in self.drop_indexes(safe):
+            db.execute(clause, safe)
+
+
 cdef class Model(Node):
     """
     Python representation of a database table and table metadata.
@@ -2171,6 +2331,14 @@ cdef class Model(Node):
             data[name] = meta.defaults_callables[name]()
 
         return data
+
+    @classmethod
+    def create_table(cls, safe=True):
+        ModelSchemaManager(cls).create_all(safe)
+
+    @classmethod
+    def drop_table(cls, safe=True):
+        ModelSchemaManager(cls).drop_all(safe)
 
     cpdef save(self, force_insert=False):
         cdef:
