@@ -1111,6 +1111,10 @@ cpdef Clause select(selection, from_list=None, joins=None, where=None,
     cdef:
         basestring command = 'SELECT'
         list parts
+        list stack = list(from_list)
+        object curr
+        set seen = set()
+        tuple join
 
     if distinct:
         command += ' DISTINCT'
@@ -1119,8 +1123,24 @@ cpdef Clause select(selection, from_list=None, joins=None, where=None,
         parts.append(SQL('FROM'))
         parts.append(CommaClause(from_list))
 
-    if joins is not None:
-        pass
+    if joins:
+        if model:
+            stack.append(model)
+
+        while stack:
+            curr = stack.pop()
+            if curr in seen or curr not in joins:
+                continue
+            seen.add(curr)
+
+            for join in joins[curr]:
+                # 3-tuple of dest, expr, type.
+                parts.extend([
+                    SQL('%s JOIN' % join[2]),
+                    join[0],
+                    SQL('ON'),
+                    join[1]])
+                stack.append(join[0])
 
     if where is not None:
         parts.append(SQL('WHERE'))
@@ -1387,16 +1407,18 @@ cdef class Query(Node):
 
 cdef class SelectQuery(Query):
     cdef:
+        CursorWrapper cursor_wrapper
+        public bint _distinct, _dicts, _namedtuples
+        public dict _joins
+        public int _limit, _offset
         public list _select, _from, _group_by, _order_by
         public Node _having
-        public int _limit, _offset
-        public bint _distinct, _dicts, _namedtuples
-        CursorWrapper cursor_wrapper
 
     def __init__(self, database, model=None):
         super(SelectQuery, self).__init__(database, model)
         self._select = None
         self._from = None
+        self._joins = {}
         self._group_by = None
         self._having = None
         self._order_by = None
@@ -1415,6 +1437,7 @@ cdef class SelectQuery(Query):
             query._select = list(self._select)
         if self._from is not None:
             query._from = self._from
+        query._joins = dict(self._joins)
         if self._group_by is not None:
             query._group_by = list(self._group_by)
         if self._having is not None:
@@ -1437,6 +1460,37 @@ cdef class SelectQuery(Query):
     @returns_clone
     def from_(self, *sources):
         self._from = list(sources)
+
+    @returns_clone
+    def join(self, src, dest=None, expr=None, join_type='INNER'):
+        # Allow for flexibility in what types of values are accepted here.
+        if isinstance(src, ForeignKeyField):
+            self._joins.setdefault(src.model, [])
+            self._joins[src.model].append((
+                src.rel_model,
+                src == src.rel_field,
+                join_type))
+        elif src is not None and dest is not None:
+            self._joins.setdefault(src, [])
+            if expr is None:
+                # If src is Tweet and dest is User...
+                for field_name, foreign_key in src._meta.refs.items():
+                    if foreign_key.rel_model == dest:
+                        expr = (foreign_key == foreign_key.rel_field)
+                        break
+            if expr is None:
+                # If src is User and dest is Tweet...
+                for backref, foreign_key in src._meta.backrefs.items():
+                    if foreign_key.model == dest:
+                        expr = (foreign_key.rel_field == foreign_key)
+                        break
+
+            self._joins[src].append((
+                dest,
+                expr,
+                join_type))
+        else:
+            raise ValueError('Insufficient data to perform join.')
 
     @returns_clone
     def group_by(self, *grouping):
@@ -1536,7 +1590,7 @@ cdef class SelectQuery(Query):
         query = select(
             selection,
             self._from,
-            None,  # Joins.
+            self._joins,
             self._where,
             self._group_by,
             self._having,
@@ -1955,7 +2009,6 @@ cdef class ForeignKeyField(Field):
             self.rel_field = field
         else:
             self.rel_field = model._meta.primary_key
-        self.backref = backref or '%s_set' % (model.__name__.lower())
         super(ForeignKeyField, self).__init__(*args, **kwargs)
 
     cpdef python_value(self, value):
@@ -1980,6 +2033,8 @@ cdef class ForeignKeyField(Field):
         self.column_name = self.column_name or name
         if self.column_name == name and not name.endswith('_id'):
             self.column_name = name + '_id'
+
+        self.backref = self.backref or '%s_set' % (model.__name__.lower())
 
         super(ForeignKeyField, self).bind(model, name)
 
