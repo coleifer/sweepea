@@ -40,25 +40,12 @@ Favorite = create_model(test_db, 'favorite', (
 
 class BaseTestCase(unittest.TestCase):
     def setUp(self):
-        test_db.execute_sql('DROP TABLE IF EXISTS favorite;')
-        test_db.execute_sql('DROP TABLE IF EXISTS tweet;')
-        test_db.execute_sql('DROP TABLE IF EXISTS user;')
-        test_db.execute_sql(
-            'CREATE TABLE user ('
-            'id INTEGER NOT NULL PRIMARY KEY, '
-            'username TEXT NOT NULL)')
-        test_db.execute_sql(
-            'CREATE TABLE tweet ('
-            'id INTEGER NOT NULL PRIMARY KEY, '
-            'user_id INTEGER NOT NULL REFERENCES user (id), '
-            'content TEXT NOT NULL, '
-            'timestamp DATETIME NOT NULL)')
-        test_db.execute_sql(
-            'CREATE TABLE favorite ('
-            'id INTEGER NOT NULL PRIMARY KEY, '
-            'user_id INTEGER NOT NULL REFERENCES user (id), '
-            'tweet_id INTEGER NOT NULL REFERENCES tweet (id), '
-            'timestamp DATETIME NOT NULL)')
+        Favorite.drop_table(True)
+        Tweet.drop_table(True)
+        User.drop_table(True)
+        User.create_table()
+        Tweet.create_table()
+        Favorite.create_table()
 
     def tearDown(self):
         test_db.close()
@@ -291,7 +278,16 @@ class TestForeignKey(BaseTestCase):
 
     def test_select_related(self):
         query = (Tweet
-                 .select(Tweet, User))
+                 .select(Tweet.content, User.username)
+                 .from_(Tweet, User)
+                 .where(Tweet.user == User.id)
+                 .order_by(User.username.desc(), Tweet.content.asc()))
+        results = [d for d in query.dicts()]
+        self.assertEqual(results, [
+            {'content': 'woof', 'username': 'mickey'},
+            {'content': 'meow', 'username': 'huey'},
+            {'content': 'purr', 'username': 'huey'},
+        ])
 
 
 if __name__ == '__main__':
