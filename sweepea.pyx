@@ -1139,7 +1139,7 @@ cpdef Clause select(selection, from_list=None, joins=None, where=None,
                     SQL('%s JOIN' % join[2]),
                     join[0],
                     SQL('ON'),
-                    join[1]])
+                    join[1].alias()])
                 stack.append(join[0])
 
     if where is not None:
@@ -1468,7 +1468,7 @@ cdef class SelectQuery(Query):
             self._joins.setdefault(src.model, [])
             self._joins[src.model].append((
                 src.rel_model,
-                src == src.rel_field,
+                (src == src.rel_field).alias(src.name),
                 join_type))
         elif src is not None and dest is not None:
             self._joins.setdefault(src, [])
@@ -1477,12 +1477,14 @@ cdef class SelectQuery(Query):
                 for field_name, foreign_key in src._meta.refs.items():
                     if foreign_key.rel_model == dest:
                         expr = (foreign_key == foreign_key.rel_field)
+                        expr = expr.alias(foreign_key.name)
                         break
             if expr is None:
                 # If src is User and dest is Tweet...
                 for backref, foreign_key in src._meta.backrefs.items():
                     if foreign_key.model == dest:
                         expr = (foreign_key.rel_field == foreign_key)
+                        expr = expr.alias(dest._meta.name)
                         break
 
             self._joins[src].append((
@@ -2139,24 +2141,31 @@ cdef class ModelCursorWrapper(DictCursorWrapper):
         self.model = model
         self.select = select
 
-    cdef initialize(self):
+    cdef _initialize_columns(self):
         cdef:
             basestring column
+            int idx
+            Node node
             tuple column_tuple
             tuple description = self.cursor.getdescription()
-            dict column_to_field = self.model._meta.combined
-
-        self.columns = []
-        self.converters = {}
-        for column_tuple in description:
-            column = column_tuple[0][column_tuple[0].find('.') + 1:]
-            if column in column_to_field:
-                self.converters[column] = column_to_field[column].python_value
-                self.columns.append(column_to_field[column].name)
-            else:
-                self.columns.append(column)
 
         self.ncols = len(description)
+        self.columns = []
+        self.converters = {}
+        for idx in range(self.ncols):
+            node = self.select[idx]
+            column = description[idx][0][description[idx][0].find('.') + 1:]
+
+            if isinstance(node, Field):
+                self.converters[idx] = node.python_value
+            elif column in self.model._meta.combined:
+                self.converters[idx] = (
+                    self.model._meta.combined[column].python_value)
+
+            self.columns.append(column)
+
+    cdef initialize(self):
+        self._initialize_columns()
 
     cdef process_row(self, tuple row):
         cdef:
@@ -2166,12 +2175,94 @@ cdef class ModelCursorWrapper(DictCursorWrapper):
 
         for i in range(self.ncols):
             col_name = self.columns[i]
-            if col_name in self.converters:
-                result[col_name] = self.converters[col_name](row[i])
+            if i in self.converters:
+                result[col_name] = self.converters[i](row[i])
             else:
                 result[col_name] = row[i]
 
         return self.model(**result)
+
+
+cdef class JoinedModelCursorWrapper(ModelCursorWrapper):
+    cdef:
+        dict joins
+        list column_to_model
+        list from_
+        list join_list
+        set selected_models
+
+    def __init__(self, cursor, model, list select, list from_, dict joins):
+        super(JoinedModelCursorWrapper, self).__init__(cursor, model, select)
+        self.joins = joins
+        self.from_ = from_
+
+    cdef initialize(self):
+        cdef:
+            basestring attr
+            int idx
+            list join_list, stack
+            Node node
+            set seen = set()
+
+        self._initialize_columns()
+
+        # Determine which models have been selected.
+        self.column_to_model = []
+        self.selected_models = set([self.model])
+
+        for idx in range(self.ncols):
+            node = self.select[idx]
+            if isinstance(node, Field):
+                key = node.model
+            else:
+                key = self.model
+            self.selected_models.add(key)
+            self.column_to_model.append(key)
+
+        self.join_list = []
+        stack = [self.model] + self.from_
+        while stack:
+            current = stack.pop()
+            if current not in self.joins or current in seen:
+                continue
+            seen.add(current)
+            for join in self.joins[current]:
+                # Join is a 3-tuple of dest, expr, type.
+                if join[0] in self.selected_models or \
+                   current in self.selected_models:
+                    self.join_list.append((current,) + join)
+                    stack.append(join[0])
+
+    cdef process_row(self, tuple row):
+        # Follow join graph.
+        cdef:
+            basestring join_type
+            dict models = {}
+            Expression expr
+            int idx
+            list instances = []
+
+        for idx in range(self.ncols):
+            constructor = self.column_to_model[idx]
+            if constructor not in models:
+                models[constructor] = constructor()
+            instance = models[constructor]
+            if idx in self.converters:
+                setattr(
+                    instance,
+                    self.columns[idx],
+                    self.converters[idx](row[idx]))
+            else:
+                setattr(instance, self.columns[idx], row[idx])
+
+        prepared = [models[self.model]]
+        for (src, dest, expr, join_type) in self.join_list:
+            instance = models[src]
+            joined_instance = models[dest]
+            setattr(instance, expr._alias or expr.rhs.name, joined_instance)
+            prepared.append(joined_instance)
+
+        return prepared[0]
 
 
 cdef class ModelSelectQuery(SelectQuery):
@@ -2180,7 +2271,18 @@ cdef class ModelSelectQuery(SelectQuery):
     ModelCursorWrapper.
     """
     cdef CursorWrapper get_default_cursor_wrapper(self):
-        return ModelCursorWrapper(self._execute(), self.model, self._select)
+        if self._joins:
+            return JoinedModelCursorWrapper(
+                self._execute(),
+                self.model,
+                self._select,
+                self._from,
+                self._joins)
+        else:
+            return ModelCursorWrapper(
+                self._execute(),
+                self.model,
+                self._select)
 
 
 class DoesNotExist(Exception): pass

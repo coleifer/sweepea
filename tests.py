@@ -290,5 +290,24 @@ class TestForeignKey(BaseTestCase):
         ])
 
 
+class TestJoins(BaseTestCase):
+    def setUp(self):
+        super(TestJoins, self).setUp()
+        self.huey = User.create(username='huey')
+        self.mickey = User.create(username='mickey')
+        for huey_tweet in ['meow', 'purr']:
+            Tweet.create(user=self.huey, content=huey_tweet)
+        woof = Tweet.create(user=self.mickey, content='woof')
+        Favorite.create(user=self.huey, tweet=woof)
+        Favorite.create(user=self.mickey, tweet=woof)
+
+    def test_simple_join(self):
+        query = (Tweet
+                 .select(Tweet, User)
+                 .join(Tweet.user)
+                 .order_by(Tweet.id))
+        tweets = [tweet for tweet in query]
+
+
 if __name__ == '__main__':
     unittest.main(argv=sys.argv)
