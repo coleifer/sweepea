@@ -46,26 +46,32 @@ def title(s):
     return s.title()
 
 
-User = create_model(test_db, 'user', (
-    ('username', TextField()),
-))
+class Base(Declarative):
+    class Meta:
+        database = test_db
 
-Tweet = create_model(test_db, 'tweet', (
-    ('user', ForeignKeyField(User, column='user_id', backref='tweets')),
-    ('content', TextField(default='')),
-    ('timestamp', DateTimeField(default=datetime.datetime.now)),
-))
+class User(Base):
+    username = TextField()
 
-Favorite = create_model(test_db, 'favorite', (
-    ('user', ForeignKeyField(User, column='user_id', backref='favorites')),
-    ('tweet', ForeignKeyField(Tweet, column='tweet_id')),
-    ('timestamp', DateTimeField(default=datetime.datetime.now)),
-))
+class Tweet(Base):
+    user = ForeignKeyField(User, column='user_id', backref='tweets')
+    content = TextField(default='')
+    timestamp = DateTimeField(default=datetime.datetime.now)
 
-Category = create_model(test_db, 'category', (
-    ('name', TextField(index=True)),
-    ('parent', ForeignKeyField('self', null=True, backref='children')),
-))
+class Favorite(Base):
+    user = ForeignKeyField(User, column='user_id', backref='favorites')
+    tweet = ForeignKeyField(Tweet, column='tweet_id')
+    timestamp = DateTimeField(default=datetime.datetime.now)
+
+class Category(Base):
+    name = TextField(index=True)
+    parent = ForeignKeyField('self', null=True, backref='children')
+
+
+UserTbl = User._meta.table
+TweetTbl = Tweet._meta.table
+FavoriteTbl = Favorite._meta.table
+
 
 def create_fts_model(tbl_name, fields, **updates):
     options = {'tokenize': 'porter'}
@@ -95,11 +101,6 @@ MultiColumn = create_fts_model('multicolumn_fts', (
     ('c3', TextField(default='')),
     ('c4', IntegerField()),
 ))
-
-
-UserTbl = User._meta.table
-TweetTbl = Tweet._meta.table
-FavoriteTbl = Favorite._meta.table
 
 
 class BaseTestCase(unittest.TestCase):
@@ -138,7 +139,7 @@ class BaseTestCase(unittest.TestCase):
 class ModelTestCase(BaseTestCase):
     def setUp(self):
         test_db.drop_tables([Favorite, Tweet, User, Category], True)
-        test_db.create_tables([Favorite, Tweet, User, Category], True)
+        test_db.create_tables([Favorite, Tweet, User, Category])
         super(ModelTestCase, self).setUp()
 
     def tearDown(self):
@@ -256,6 +257,48 @@ class TestDatabaseClass(ModelTestCase):
             ('user_id', 'user', 'id'),
         ])
 
+    def test_metadata(self):
+        self.assertEqual(
+            [field.name for field in User._meta.sorted_fields],
+            ['id', 'username'])
+
+        self.assertEqual(
+            [field.name for field in Tweet._meta.sorted_fields],
+            ['id', 'user', 'content', 'timestamp'])
+
+
+        self.assertEqual(Tweet._meta.columns, {
+            'id': Tweet.id,
+            'user_id': Tweet.user,
+            'content': Tweet.content,
+            'timestamp': Tweet.timestamp})
+        self.assertEqual(Tweet._meta.defaults, {'content': ''})
+        self.assertEqual(Tweet._meta.defaults_callables,
+                         {'timestamp': datetime.datetime.now})
+        self.assertEqual(Tweet._meta.fields, {
+            'id': Tweet.id,
+            'user': Tweet.user,
+            'content': Tweet.content,
+            'timestamp': Tweet.timestamp})
+        self.assertEqual(Tweet._meta.name, 'tweet')
+        self.assertEqual(Tweet._meta.primary_key, Tweet.id)
+        self.assertEqual(Tweet._meta.table_name, 'tweet')
+
+    def test_metadata_references(self):
+        self.assertEqual(User._meta.refs, {})
+        self.assertEqual(
+            User._meta.backrefs,
+            {'favorites': User.favorites, 'tweets': User.tweets})
+
+        self.assertEqual(Tweet._meta.refs, {'user': Tweet.user})
+        self.assertEqual(
+            Tweet._meta.backrefs,
+            {'favorite_set': Tweet.favorite_set})
+
+        self.assertEqual(Category._meta.refs, {'parent': Category.parent})
+        self.assertEqual(Category._meta.backrefs,
+                         {'children': Category.children})
+
 
 class TestDDL(BaseTestCase):
     def assertDDL(self, clause, sql):
@@ -361,6 +404,62 @@ class TestSQL(BaseTestCase):
             'INNER JOIN "user" AS user_alt '
             'ON ("user"."username" = "user_alt"."username") '
             'GROUP BY "user"."username"'))
+
+    def test_select_join_query(self):
+        TweetAlias = Tweet.alias('t2')
+        subquery = (SelectQuery(test_db)
+                    .select(
+                        TweetAlias.user,
+                        fn.MAX(TweetAlias.timestamp).alias('max_ts'))
+                    .from_(TweetAlias)
+                    .group_by(TweetAlias.user)
+                    .alias('tweet_max_subquery'))
+
+        query = (Tweet
+                 .select(Tweet, User)
+                 .join(Tweet.user)
+                 .join(
+                     Tweet,
+                     subquery,
+                     ((Tweet.timestamp == subquery.c.max_ts) &
+                      (Tweet.user == subquery.c.user_id))))
+
+        self.assertSQL(query, (
+            'SELECT "tweet"."id", "tweet"."user_id", "tweet"."content", '
+            '"tweet"."timestamp", "user"."id", "user"."username" '
+            'FROM "tweet" '
+            'INNER JOIN "user" ON ("tweet"."user_id" = "user"."id") '
+            'INNER JOIN ('
+            'SELECT "t2"."user", MAX("t2"."timestamp") AS max_ts '
+            'FROM "tweet" AS t2 '
+            'GROUP BY "t2"."user") '
+            'AS tweet_max_subquery ON ('
+            '("tweet"."timestamp" = "tweet_max_subquery"."max_ts") AND '
+            '("tweet"."user_id" = "tweet_max_subquery"."user_id"))'))
+
+    def test_self_join(self):
+        TweetAlias = Tweet.alias('t2')
+        query = (Tweet
+                 .select(Tweet, User)
+                 .join(Tweet.user)
+                 .join(
+                     Tweet,
+                     TweetAlias,
+                     ((TweetAlias.user == User.id) &
+                      (Tweet.timestamp < TweetAlias.timestamp)),
+                     'LEFT OUTER')
+                 .where(TweetAlias.id.is_null()))
+
+        self.assertSQL(query, (
+            'SELECT "tweet"."id", "tweet"."user_id", "tweet"."content", '
+            '"tweet"."timestamp", "user"."id", "user"."username" '
+            'FROM "tweet" '
+            'INNER JOIN "user" ON ("tweet"."user_id" = "user"."id") '
+            'LEFT OUTER JOIN "tweet" AS t2 ON ('
+            '("t2"."user" = "user"."id") AND '
+            '("tweet"."timestamp" < "t2"."timestamp")) '
+            'WHERE ("t2"."id" IS ?)'
+        ))
 
     def test_update(self):
         query = (UpdateQuery(test_db, table=UserTbl)
