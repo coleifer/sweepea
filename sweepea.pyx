@@ -13,6 +13,68 @@ from inspect import isclass
 
 import apsw
 
+try:  # Python 2.7+
+    from logging import NullHandler
+except ImportError:
+    class NullHandler(logging.Handler):
+        def emit(self, record):
+            pass
+
+logger = logging.getLogger('sweepea')
+logger.addHandler(NullHandler())
+
+
+# Date and timestamp helpers.
+cdef list DATETIME_PARTS = ['year', 'month', 'day', 'hour', 'minute', 'second']
+cdef set DATETIME_LOOKUPS = set(DATETIME_PARTS)
+
+# Sqlite does not support the `date_part` SQL function, so we will define an
+# implementation with a UDF.
+cdef tuple SQLITE_DATETIME_FORMATS = (
+    '%Y-%m-%d %H:%M:%S',
+    '%Y-%m-%d %H:%M:%S.%f',
+    '%Y-%m-%d',
+    '%H:%M:%S',
+    '%H:%M:%S.%f',
+    '%H:%M')
+
+cdef int _sqlite_date_part(basestring lookup_type, basestring datetime_string):
+    cdef datetime.datetime dt
+    assert lookup_type in DATETIME_LOOKUPS
+    if not datetime_string:
+        return None
+    dt = format_date_time(datetime_string, SQLITE_DATETIME_FORMATS)
+    return getattr(dt, lookup_type)
+
+cdef dict SQLITE_DATE_TRUNC_MAPPING = {
+    'year': '%Y',
+    'month': '%Y-%m',
+    'day': '%Y-%m-%d',
+    'hour': '%Y-%m-%d %H',
+    'minute': '%Y-%m-%d %H:%M',
+    'second': '%Y-%m-%d %H:%M:%S'}
+
+cdef basestring _sqlite_date_trunc(basestring lookup_type,
+                                   basestring datetime_string):
+    cdef datetime.datetime dt
+    assert lookup_type in SQLITE_DATE_TRUNC_MAPPING
+    if not datetime_string:
+        return None
+    dt = format_date_time(datetime_string, SQLITE_DATETIME_FORMATS)
+    return dt.strftime(SQLITE_DATE_TRUNC_MAPPING[lookup_type])
+
+cdef bint _sqlite_regexp(basestring regex, basestring value):
+    return re.search(regex, value, re.I) is not None
+
+cdef format_date_time(basestring value, tuple formats):
+    cdef basestring fmt
+    for fmt in formats:
+        try:
+            return datetime.datetime.strptime(value, fmt)
+        except ValueError:
+            pass
+    return value
+
 
 class _ConnectionLocal(threading.local):
     def __init__(self, **kwargs):
@@ -33,18 +95,20 @@ cdef class _callable_context_manager(object):
 cdef class Database(object):
     cdef:
         basestring filename
-        bint rank_functions
+        bint date_functions, rank_functions, regex_functions
         dict _aggregates, _collations, _functions, _modules
         dict connect_params
         object _local, _lock
         readonly QueryBuilder query_builder
         tuple pragmas
 
-    def __init__(self, filename=':memory:', pragmas=None, rank_functions=True,
-                 **kwargs):
+    def __init__(self, filename=':memory:', pragmas=None, date_functions=True,
+                 rank_functions=True, regex_functions=True, **kwargs):
         self.filename = filename
         self.pragmas = pragmas or ()
+        self.date_functions = date_functions
         self.rank_functions = rank_functions
+        self.regex_functions = regex_functions
         self.connect_params = kwargs
         self._local = _ConnectionLocal()
         self._lock = threading.Lock()
@@ -54,9 +118,16 @@ cdef class Database(object):
         self._functions = {}
         self._modules = {}
 
+        if self.date_functions:
+            self.func('date_part')(_sqlite_date_part)
+            self.func('date_trunc')(_sqlite_date_trunc)
+
         if self.rank_functions:
             self.func('rank')(rank)
             self.func('bm25')(bm25)
+
+        if self.regex_functions:
+            self.func('regexp')(_sqlite_regexp)
 
     def __enter__(self):
         """
@@ -893,7 +964,7 @@ cdef class Function(Node):
     cdef:
         readonly basestring name
         readonly tuple arguments
-        bint _coerce
+        readonly bint _coerce
 
     node_type = 'function'
 
@@ -914,6 +985,10 @@ cdef class Function(Node):
 
     cdef clone_base(self):
         return Function(self.name, self.arguments, self._coerce)
+
+    @returns_clone
+    def coerce(self, coerce=True):
+        self._coerce = coerce
 
 
 fn = Function(None, None)
@@ -1150,12 +1225,32 @@ cdef class CursorWrapper(object):
             return iter(self.row_cache)
         return ResultIterator(self)
 
+    def __getitem__(self, item):
+        if isinstance(item, slice):
+            start = item.start
+            stop = item.stop
+            if stop is None or stop < 0:
+                self.fill_cache()
+            else:
+                self.fill_cache(stop)
+            return self.row_cache[item]
+        elif isinstance(item, int):
+            self.fill_cache(item if item > 0 else 0)
+            return self.row_cache[item]
+        else:
+            raise ValueError('CursorWrapper only supports integer and slice '
+                             'indexes.')
+
     cdef initialize(self):
         pass
 
-    cdef iterate(self):
+    cdef iterate(self, bint cache=True):
         cdef tuple row
-        row = self.cursor.fetchone()
+        try:
+            row = self.cursor.fetchone()
+        except apsw.CursorClosedError:
+            self.populated = True
+            raise StopIteration
         if not row:
             self.populated = True
             self.cursor.close()
@@ -1164,8 +1259,11 @@ cdef class CursorWrapper(object):
             self.initialize()  # Lazy initialization.
             self.initialized = True
         self.count += 1
-        self.row_cache.append(self.process_row(row))
-        return self.row_cache[-1]
+        if cache:
+            self.row_cache.append(self.process_row(row))
+            return self.row_cache[-1]
+        else:
+            return self.process_row(row)
 
     cdef process_row(self, tuple row):
         return row
@@ -1173,9 +1271,9 @@ cdef class CursorWrapper(object):
     def iterator(self):
         """Efficient one-pass iteration over the result set."""
         while True:
-            yield self.iterate()
+            yield self.iterate(False)
 
-    cdef fill_cache(self, float n=0):
+    cpdef fill_cache(self, float n=0):
         cdef:
             ResultIterator iterator
 
@@ -1229,7 +1327,10 @@ cdef class NamedTupleCursorWrapper(CursorWrapper):
         object tuple_class
 
     cdef initialize(self):
-        self.tuple_class = namedtuple('Row', self.cursor.getdescription)
+        cdef tuple description = self.cursor.getdescription()
+        self.tuple_class = namedtuple(
+            'Row',
+            [col[0][col[0].find('.') + 1:].strip('"') for col in description])
 
     cdef process_row(self, tuple row):
         return self.tuple_class(*row)
@@ -1264,6 +1365,9 @@ cdef class ResultIterator(object):
     def __init__(self, cursor_wrapper):
         self.cursor_wrapper = cursor_wrapper
         self.index = 0
+
+    def __iter__(self):
+        return self
 
     def __next__(self):
         if self.index < self.cursor_wrapper.count:
@@ -1348,6 +1452,9 @@ cpdef Clause select(selection, from_list=None, joins=None, where=None,
 
 cdef tuple simple_key(key, model):
     cdef Field field = None
+    if isinstance(key, Field):
+        field = key
+        return field.column_name, field
 
     if isinstance(key, _BaseEntity):
         key = key.path[-1]
@@ -1373,6 +1480,7 @@ cpdef Clause update(table, values, where=None, limit=None, on_conflict=None,
         object value
         list values_list = []
         Entity e_key
+        Field field
 
     if on_conflict:
         parts.append(SQL('UPDATE OR %s' % on_conflict))
@@ -1385,7 +1493,7 @@ cpdef Clause update(table, values, where=None, limit=None, on_conflict=None,
         # to the appropriate SQLite type.
         key, field = simple_key(key, model)
         e_key = Entity((key,))
-        if field is not None:
+        if field is not None and not isinstance(value, Node):
             value = field.db_value(value)
 
         values_list.append(Expression(e_key, '=', value, True))
@@ -1581,13 +1689,17 @@ cdef class Query(Node):
         """Execute the query."""
         raise NotImplementedError
 
-    def scalar(self, as_tuple=False):
+    cpdef scalar(self, bint as_tuple=False, bint convert=False):
         """
         Return a single result from the query. If ``as_tuple`` is specified,
         then the row itself is returned. Otherwise the default is to return
         only the first column in the first result row.
         """
-        row = self._execute().fetchone()
+        cdef tuple row
+        if convert:
+            row = self.tuples().first()
+        else:
+            row = self._execute().fetchone()
         if row and not as_tuple:
             return row[0]
         return row
@@ -1787,7 +1899,7 @@ cdef class SelectQuery(Query):
         res = self.execute()
         res.fill_cache(1)
         try:
-            return res._result_cache[0]
+            return res.row_cache[0]
         except IndexError:
             pass
 
@@ -1820,22 +1932,28 @@ cdef class SelectQuery(Query):
             sql = '(%s)' % sql
         return sql, params
 
-    cdef CursorWrapper get_default_cursor_wrapper(self):
+    cdef CursorWrapper get_dict_cursor_wrapper(self):
+        return DictCursorWrapper(self._execute())
+
+    cdef CursorWrapper get_tuple_cursor_wrapper(self):
         return CursorWrapper(self._execute())
 
+    cdef CursorWrapper get_default_cursor_wrapper(self):
+        return self.get_tuple_cursor_wrapper()
+
     def execute(self):
-        if self.cursor_wrapper:
-            return self.cursor_wrapper
-        else:
+        if self.cursor_wrapper is None:
             if self._dicts:
-                return DictCursorWrapper(self._execute())
+                self.cursor_wrapper = self.get_dict_cursor_wrapper()
             elif self._tuples:
-                return CursorWrapper(self._execute())
+                self.cursor_wrapper = self.get_tuple_cursor_wrapper()
             elif self._namedtuples:
-                return NamedTupleCursorWrapper(self._execute())
+                self.cursor_wrapper = NamedTupleCursorWrapper(self._execute())
             elif self._constructor:
-                return ObjectCursorWrapper(self._execute(), self._constructor)
-            return self.get_default_cursor_wrapper()
+                self.cursor_wrapper = ObjectCursorWrapper(self._execute(), self._constructor)
+            else:
+                self.cursor_wrapper = self.get_default_cursor_wrapper()
+        return self.cursor_wrapper
 
     def __iter__(self):
         return iter(self.execute())
@@ -1846,14 +1964,7 @@ cdef class SelectQuery(Query):
     def __getitem__(self, value):
         cdef CursorWrapper res
         res = self.execute()
-        if isinstance(value, slice):
-            index = value.stop
-        else:
-            index = value
-        if index is not None and index >= 0:
-            index += 1
-        res.fill_cache(index)
-        return res.row_cache[value]
+        return res[value]
 
     def __hash__(self):
         return id(self)
@@ -2097,10 +2208,12 @@ cdef class Field(Node):
 
     cdef clone_base(self):
         """Create a copy of the node."""
-        cdef dict kwargs = {}
+        cdef:
+            dict kwargs = {}
+            Field clone
         if self.field_kwargs:
             kwargs.update(self.field_kwargs)
-        return type(self)(
+        clone = type(self)(
             null=self.null,
             index=self.index,
             unique=self.unique,
@@ -2110,13 +2223,17 @@ cdef class Field(Node):
             constraints=self.constraints,
             unindexed=self.unindexed,
             **kwargs)
+        if self.model is not None:
+            clone.bind(self.model, self.name, False)
+        return clone
 
-    cpdef bind(self, model, basestring name):
+    cpdef bind(self, model, basestring name, bint set_attribute=True):
         self.model = <Model>model
         self.name = name
         self.column_name = self.column_name or name
         self.column = getattr(model._meta.table, self.column_name)
-        setattr(model, name, self.get_descriptor(name))
+        if set_attribute:
+            setattr(model, name, self.get_descriptor(name))
 
     cdef get_descriptor(self, name):
         return FieldDescriptor(self, name)
@@ -2248,6 +2365,25 @@ cdef class DateTimeField(Field):
     cpdef db_value(self, value):
         return str(value) if value is not None else None
 
+    property year:
+        def __get__(self):
+            return fn.date_part('year', self).alias('year')
+    property month:
+        def __get__(self):
+            return fn.date_part('month', self).alias('month')
+    property day:
+        def __get__(self):
+            return fn.date_part('day', self).alias('day')
+    property hour:
+        def __get__(self):
+            return fn.date_part('hour', self).alias('hour')
+    property minute:
+        def __get__(self):
+            return fn.date_part('minute', self).alias('minute')
+    property second:
+        def __get__(self):
+            return fn.date_part('second', self).alias('second')
+
 
 cdef class DateField(DateTimeField):
     field_type = 'DATE'
@@ -2256,6 +2392,9 @@ cdef class DateField(DateTimeField):
         '%Y-%m-%d %H:%M:%S',
         '%Y-%m-%d %H:%M:%S.%f',
     ]
+    hour = None
+    minute = None
+    second = None
 
     cpdef python_value(self, value):
         if value and isinstance(value, basestring):
@@ -2326,7 +2465,7 @@ cdef class ForeignKeyField(Field):
             return self.rel_field._ddl_modifiers()
         return None
 
-    cpdef bind(self, model, basestring name):
+    cpdef bind(self, model, basestring name, bint set_attribute=True):
         self.column_name = self.column_name or name
         if self.column_name == name and not name.endswith('_id'):
             self.column_name = name + '_id'
@@ -2437,26 +2576,20 @@ cdef class BackrefDescriptor(object):
         return self
 
 
-cdef class ModelCursorWrapper(DictCursorWrapper):
-    """
-    CursorWrapper implementation that yields model instances. Additionally,
-    when model fields are part of the SELECT clause, the corresponding
-    ``python_value()`` functions will be used to coerce the values from the
-    database into their Python equivalents.
-    """
+cdef class ModelDictCursorWrapper(DictCursorWrapper):
     cdef:
         dict converters, fields
         list select
         object model
 
     def __init__(self, cursor, model, list select):
-        super(ModelCursorWrapper, self).__init__(cursor)
+        super(ModelDictCursorWrapper, self).__init__(cursor)
         self.model = model
         self.select = select
 
     cdef _initialize_converters(self):
         cdef:
-            basestring column
+            basestring column, path
             Field field
             int idx
             object node
@@ -2474,12 +2607,23 @@ cdef class ModelCursorWrapper(DictCursorWrapper):
                 field = self.model._meta.combined.get(column)
                 if field is not None:
                     self.converters[column] = field.python_value
+                elif (isinstance(node, Function) and node.arguments and
+                      node._coerce):
+                    # Try to special-case functions calling fields.
+                    first = node.arguments[0]
+                    if isinstance(first, Field):
+                        self.converters[column] = first.python_value
+                    elif isinstance(first, Entity):
+                        path = (<Entity>first).path[-1]
+                        field = self.model._meta.combined.get(path)
+                        if field is not None:
+                            self.converters[column] = field.python_value
 
     cdef initialize(self):
         self._initialize_columns()
         self._initialize_converters()
 
-    cdef process_row(self, tuple row):
+    cdef dict _process_row(self, tuple row):
         cdef:
             basestring col_name
             dict result
@@ -2488,7 +2632,37 @@ cdef class ModelCursorWrapper(DictCursorWrapper):
         for col_name in self.converters:
             result[col_name] = self.converters[col_name](result[col_name])
 
-        return self.model(**result)
+        return result
+
+    cdef process_row(self, tuple row):
+        return self._process_row(row)
+
+
+cdef class ModelTupleCursorWrapper(ModelCursorWrapper):
+    cdef process_row(self, tuple row):
+        cdef:
+            basestring col_name
+            list result = []
+
+        for i in range(self.ncols):
+            col_name = self.columns[i]
+            if col_name in self.converters:
+                result.append(self.converters[col_name](row[i]))
+            else:
+                result.append(row[i])
+
+        return tuple(result)
+
+
+cdef class ModelCursorWrapper(ModelDictCursorWrapper):
+    """
+    CursorWrapper implementation that yields model instances. Additionally,
+    when model fields are part of the SELECT clause, the corresponding
+    ``python_value()`` functions will be used to coerce the values from the
+    database into their Python equivalents.
+    """
+    cdef process_row(self, tuple row):
+        return self.model(**self._process_row(row))
 
 
 cdef class JoinedModelCursorWrapper(ModelCursorWrapper):
@@ -2615,6 +2789,18 @@ cdef class ModelSelectQuery(SelectQuery):
     SelectQuery subclass that, by default, when executed returns a
     ModelCursorWrapper.
     """
+    cpdef flat(self, is_flat=True):
+        func = self.model if is_flat else None
+        return self.constructor(func)
+
+    cdef CursorWrapper get_dict_cursor_wrapper(self):
+        return ModelDictCursorWrapper(self._execute(), self.model,
+                                      self._select)
+
+    cdef CursorWrapper get_tuple_cursor_wrapper(self):
+        return ModelTupleCursorWrapper(self._execute(), self.model,
+                                       self._select)
+
     cdef CursorWrapper get_default_cursor_wrapper(self):
         if self._joins:
             return JoinedModelCursorWrapper(
@@ -2628,10 +2814,6 @@ cdef class ModelSelectQuery(SelectQuery):
                 self._execute(),
                 self.model,
                 self._select)
-
-    cpdef flat(self, is_flat=True):
-        func = self.model if is_flat else None
-        return self.constructor(func)
 
 
 class DoesNotExist(Exception): pass
@@ -3020,13 +3202,13 @@ cdef class VirtualModel(Model):
 
 
 cdef class VirtualField(Field):
-    cpdef bind(self, model, basestring name):
+    cpdef bind(self, model, basestring name, bint set_attribute=True):
         super(VirtualField, self).bind(model, name)
         model._meta.remove_field(name)
 
 
 cdef class RowIDField(PrimaryKeyField):
-    cpdef bind(self, model, basestring name):
+    cpdef bind(self, model, basestring name, bint set_attribute=True):
         if name != 'rowid':
             raise ValueError('RowIDField must be named "rowid".')
         super(RowIDField, self).bind(model, name)

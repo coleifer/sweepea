@@ -104,6 +104,26 @@ def test_write(Author, Note, db):
 
 
 @timed()
+def test_write_tbl(Author, Note, db):
+    author = Author.create(name='a')
+    NoteTbl = Note._meta.table
+    if db == sweepea_db:
+        for i in range(20000):
+            db.insert({
+                NoteTbl.content: 'note-%s' % i,
+                NoteTbl.tags: str(i),
+                NoteTbl.deleted: i % 5 == 0,
+                NoteTbl.author_id: author.id})
+    else:
+        for i in range(20000):
+            Note.create(
+                content='note-%s' % i,
+                tags=str(i),
+                deleted=i % 5 == 0,
+                author=author)
+
+
+@timed()
 def test_read(Author, Note, db):
     for i in range(2):
         for note in Note.select():
@@ -115,6 +135,23 @@ def test_read_dicts(Author, Note, db):
     for i in range(2):
         for note in Note.select().dicts():
             pass
+
+
+@timed()
+def test_read_dicts_tbl(Author, Note, db):
+    if db == sweepea_db:
+        NoteTbl = Note._meta.table
+        for i in range(2):
+            query = (db
+                     .select(NoteTbl.id, NoteTbl.content, NoteTbl.tags,
+                             NoteTbl.deleted, NoteTbl.author_id)
+                     .from_(NoteTbl))
+            for data in query.dicts():
+                pass
+    else:
+        for i in range(2):
+            for note in Note.select().dicts():
+                pass
 
 
 @timed()
@@ -167,9 +204,13 @@ def test_read_update(Author, Note, db):
 if __name__ == '__main__':
     create()
     test_write()
+    drop()
+    create()
+    test_write_tbl()
 
     test_read()
     test_read_dicts()
+    test_read_dicts_tbl()
     test_read_tuples()
     test_read_join()
     test_filter()

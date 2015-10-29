@@ -58,6 +58,11 @@ class Tweet(Base):
     content = TextField(default='')
     timestamp = DateTimeField(default=datetime.datetime.now)
 
+class Comment(Base):
+    tweet = ForeignKeyField(Tweet, backref='comments')
+    comment = TextField(default='')
+    timestamp = DateTimeField(default=datetime.datetime.now)
+
 class Favorite(Base):
     user = ForeignKeyField(User, column='user_id', backref='favorites')
     tweet = ForeignKeyField(Tweet, column='tweet_id')
@@ -67,9 +72,19 @@ class Category(Base):
     name = TextField(index=True)
     parent = ForeignKeyField('self', null=True, backref='children')
 
+class _UpperField(TextField):
+    def python_value(self, value):
+        return value.upper() if value else value
+
+class UpperUser(Base):
+    username = _UpperField()
+    class Meta:
+        table_name = User._meta.table_name
+
 
 UserTbl = User._meta.table
 TweetTbl = Tweet._meta.table
+CommentTbl = Comment._meta.table
 FavoriteTbl = Favorite._meta.table
 
 
@@ -137,9 +152,11 @@ class BaseTestCase(unittest.TestCase):
 
 
 class ModelTestCase(BaseTestCase):
+    MODELS = [User, Tweet, Comment, Favorite, Category]
+
     def setUp(self):
-        test_db.drop_tables([Favorite, Tweet, User, Category], True)
-        test_db.create_tables([Favorite, Tweet, User, Category])
+        test_db.drop_tables(self.MODELS, True)
+        test_db.create_tables(self.MODELS)
         super(ModelTestCase, self).setUp()
 
     def tearDown(self):
@@ -220,7 +237,8 @@ class TestDatabaseClass(ModelTestCase):
 
     def test_introspection(self):
         tables = test_db.get_tables()
-        self.assertEqual(tables, ['category', 'favorite', 'tweet', 'user'])
+        self.assertEqual(tables,
+                         ['category', 'comment', 'favorite', 'tweet', 'user'])
 
         user_indexes = test_db.get_indexes('user')
         tweet_indexes = test_db.get_indexes('tweet')
@@ -293,11 +311,41 @@ class TestDatabaseClass(ModelTestCase):
         self.assertEqual(Tweet._meta.refs, {'user': Tweet.user})
         self.assertEqual(
             Tweet._meta.backrefs,
-            {'favorite_set': Tweet.favorite_set})
+            {'comments': Tweet.comments, 'favorite_set': Tweet.favorite_set})
 
         self.assertEqual(Category._meta.refs, {'parent': Category.parent})
         self.assertEqual(Category._meta.backrefs,
                          {'children': Category.children})
+
+    def test_udf(self):
+        curs = test_db.execute_sql('SELECT TITLE(?) AS foo', ('heLLo huey',))
+        self.assertEqual(curs.fetchone(), ('Hello Huey',))
+
+    def test_date_functions(self):
+        dt = datetime.datetime
+        datetimes = [
+            dt(2015, 1, 2, 3, 4, 5),
+            dt(2015, 2, 20, 19, 18, 17),
+            dt(2015, 12, 25, 0, 0, 0),
+            dt(2014, 12, 31, 23, 59, 59, 999999)]
+
+        user = User.create(username='u1')
+        for value in datetimes:
+            Tweet.create(user=user, content=str(value), timestamp=value)
+
+        ts = Tweet.timestamp
+        query = (Tweet
+                 .select(
+                     Tweet.id, ts.year, ts.month, ts.day, ts.hour, ts.minute,
+                     ts.second)
+                 .order_by(Tweet.id))
+        self.assertEqual(
+            [(t.id, t.year, t.month, t.day, t.hour, t.minute, t.second)
+             for t in query], [
+                 (1, 2015, 1, 2, 3, 4, 5),
+                 (2, 2015, 2, 20, 19, 18, 17),
+                 (3, 2015, 12, 25, 0, 0, 0),
+                 (4, 2014, 12, 31, 23, 59, 59)])
 
 
 class TestDDL(BaseTestCase):
@@ -461,6 +509,17 @@ class TestSQL(BaseTestCase):
             'WHERE ("t2"."id" IS ?)'
         ))
 
+        Parent = Category.alias('parent')
+        query = (Category
+                 .select(Category, Parent.name)
+                 .join(Category, Parent, (Category.parent == Parent.id)))
+        self.assertSQL(query, (
+            'SELECT "category"."id", "category"."name", "category"."parent_id"'
+            ', "parent"."name" '
+            'FROM "category" '
+            'INNER JOIN "category" AS parent '
+            'ON ("category"."parent_id" = "parent"."id")'))
+
     def test_update(self):
         query = (UpdateQuery(test_db, table=UserTbl)
                  .set(
@@ -475,6 +534,14 @@ class TestSQL(BaseTestCase):
             'WHERE ("user"."username" IN (?, ?, ?)) LIMIT ?'),
             ('-zai', 3, 1337, 'foo', 'bar', 'baz', 2))
 
+        query = (User
+                 .update(username=User.select(fn.MAX(User.id).alias('max_id')))
+                 .where(User.id < 100))
+        self.assertSQL(query, (
+            'UPDATE "user" SET "username" = ('
+            'SELECT MAX("user"."id") AS max_id FROM "user") '
+            'WHERE ("user"."id" < ?)'))
+
     def test_insert_dict(self):
         query = (InsertQuery(test_db)
                  .into(UserTbl)
@@ -485,6 +552,11 @@ class TestSQL(BaseTestCase):
         self.assertSQL(query, (
             'INSERT INTO "user" ("username", "id") VALUES (?, ?)'),
             ('charlie', 100))
+
+        query = User.insert({User.username: 'baz'})
+        self.assertSQL(query, (
+            'INSERT INTO "user" ("username") VALUES (?)'),
+            ('baz',))
 
     def test_insert_list(self):
         def generator():
@@ -498,6 +570,13 @@ class TestSQL(BaseTestCase):
             'INSERT INTO "user" ("username", "id") '
             'VALUES (?, ?), (?, ?), (?, ?)'),
             ('foo-0', 0, 'foo-1', 1, 'foo-2', 2))
+
+        query = User.insert(rows=[
+            {User.username: 'u%s' % i} for i in range(3)])
+        self.assertSQL(query, (
+            'INSERT INTO "user" ("username") '
+            'VALUES (?), (?), (?)'),
+            ('u0', 'u1', 'u2'))
 
     def test_insert_select(self):
         query = (InsertQuery(test_db)
@@ -598,6 +677,22 @@ class TestModelAPIs(ModelTestCase):
         # datetime when reading it from the database.
         self.assertEqual(tweet_db.timestamp, test_timestamp)
 
+        # Even if we alias our field, it will still be correctly coerced.
+        tweet = (Tweet
+                 .select(Tweet, Tweet.timestamp.alias('foo'))
+                 .where(Tweet.content == 'foo')
+                 .get())
+        self.assertEqual(tweet.timestamp, test_timestamp)
+        self.assertEqual(tweet.foo, test_timestamp)
+
+        # By using an aliased entity we get the raw value.
+        tweet = (Tweet
+                 .select(Tweet, TweetTbl.timestamp.alias('foo'))
+                 .where(Tweet.content == 'foo')
+                 .get())
+        self.assertEqual(tweet.timestamp, test_timestamp)
+        self.assertEqual(tweet.foo, '2015-01-02 03:04:05.000006')
+
     def test_model_shorthand(self):
         query = (Tweet
                  .select(Tweet, User)
@@ -610,10 +705,6 @@ class TestModelAPIs(ModelTestCase):
             'FROM "tweet", "user" '
             'WHERE ("tweet"."user_id" = "user"."id")'))
         self.assertEqual(params, ())
-
-    def test_udf(self):
-        curs = test_db.execute_sql('SELECT TITLE(?) AS foo', ('heLLo huey',))
-        self.assertEqual(curs.fetchone(), ('Hello Huey',))
 
 
 class TestForeignKey(ModelTestCase):
@@ -658,6 +749,18 @@ class TestForeignKey(ModelTestCase):
             meow.user_id = self.huey.id
             self.assertEqual(meow.user_id, self.huey.id)
             self.assertEqual(meow.user, self.huey)
+
+        # We can assign a dictionary to the foreign key descriptor, and it
+        # is treated like a list of related model attributes.
+        with self.assertQueryCount(0):
+            meow.user = {
+                'id': self.mickey.id,
+                'test_attr': 'test',
+                'username': 'mickey-xx'}
+            self.assertEqual(meow.user_id, self.mickey.id)
+            self.assertEqual(meow.user.id, self.mickey.id)
+            self.assertEqual(meow.user.test_attr, 'test')
+            self.assertEqual(meow.user.username, 'mickey-xx')
 
         # Sanity check.
         self.assertEqual(Tweet.select().count(), 3)
@@ -709,12 +812,49 @@ class TestForeignKey(ModelTestCase):
              ('mickey', 'mickey', 'woof'),
              ('huey', 'mickey', 'alt')])
 
+    def test_foreign_key_aggregation(self):
+        zaizee = User.create(username='zaizee')
+        query = (User
+                 .select(User, fn.COUNT(Tweet.id).alias('count'))
+                 .join(User.tweets)
+                 .group_by(User)
+                 .order_by(SQL('count DESC')))
+        data = [(user.username, user.count) for user in query]
+        self.assertEqual(data, [
+            ('huey', 2),
+            ('mickey', 1),
+            ('zaizee', 0)])
+
+        subquery = (Tweet
+                    .select(fn.COUNT(Tweet.id).alias('ct'))
+                    .where(Tweet.user == User.id)
+                    .alias('tweet_ct'))
+        query = (User
+                 .select(
+                     User,
+                     subquery)
+                 .order_by(SQL('tweet_ct DESC')))
+        data = [(user.username, user.tweet_ct) for user in query]
+        self.assertEqual(data, [
+            ('huey', 2),
+            ('mickey', 1),
+            ('zaizee', 0)])
+
     def test_dependency_resolution(self):
         accum = []
         for query, fk in reversed(list(self.huey.dependencies())):
             accum.append(fk.model.select().where(query).sql())
 
         self.assertEqual(accum, [
+            # Comments.
+            ('SELECT "comment"."id", "comment"."tweet_id", '
+             '"comment"."comment", "comment"."timestamp" '
+             'FROM "comment" '
+             'WHERE ("comment"."tweet_id" IN ('
+             'SELECT "tweet"."id" '
+             'FROM "tweet" '
+             'WHERE ("tweet"."user_id" = ?)))', (1,)),
+
             # Favorites by tweet by user (most complex).
             ('SELECT "favorite"."id", "favorite"."user_id", '
              '"favorite"."tweet_id", "favorite"."timestamp" '
@@ -782,6 +922,13 @@ class TestForeignKey(ModelTestCase):
                 {'content': 'purr', 'username': 'huey'},
             ])
 
+        with self.assertQueryCount(1):
+            results = [(tweet.content, tweet.username) for tweet in query]
+            self.assertEqual(results, [
+                ('woof', 'mickey'),
+                ('meow', 'huey'),
+                ('purr', 'huey')])
+
 
 class TestForeignKeySelf(ModelTestCase):
     def setUp(self):
@@ -813,7 +960,7 @@ class TestForeignKeySelf(ModelTestCase):
 
     def test_join_filter(self):
         # Test joining.
-        Parent = Category._meta.table.alias('parent')
+        Parent = Category.alias('parent')
         query = (Category
                  .select()
                  .join(Category, Parent, (Category.parent == Parent.id))
@@ -822,16 +969,27 @@ class TestForeignKeySelf(ModelTestCase):
 
     def test_select_related(self):
         # Test select related.
-        Parent = Category._meta.table.alias('parent')
-        query = (Category
-                 .select(Category, Parent.id, Parent.name, Parent.parent_id)
-                 .join(
-                     Category,
-                     Parent,
-                     (Category.parent == Parent.id).alias('pt'))
-                 .order_by(Category.id))
-        categories = [c for c in query]
-        # XXX: broken at the moment.
+        Parent = Category.alias('parent')
+        with self.assertQueryCount(1):
+            query = (Category
+                     .select(Category, Parent.name, Parent.parent_id)
+                     .join(
+                         Category,
+                         Parent,
+                         (Category.parent == Parent.id),
+                         'LEFT OUTER')
+                     .order_by(Category.id))
+
+            results = [(cat.parent.name, cat.name) for cat in query]
+            self.assertEqual(results, [
+                (None, 'p'),
+                ('p', 'c-0'),
+                ('c-0', 'gc-0-0'),
+                ('c-0', 'gc-0-1'),
+                ('p', 'c-1'),
+                ('c-1', 'gc-1-0'),
+                ('c-1', 'gc-1-1'),
+            ])
 
 
 class TestJoins(ModelTestCase):
@@ -901,7 +1059,7 @@ class TestJoins(ModelTestCase):
                      .join(
                          UserTbl,
                          TweetTbl,
-                         (UserTbl.id == TweetTbl.user_id).alias('tweez'))
+                         (UserTbl.id == TweetTbl.user_id))
                      .order_by(TweetTbl.id.desc()))
             results = [row for row in query]
             self.assertEqual(results, [
@@ -909,7 +1067,7 @@ class TestJoins(ModelTestCase):
 
     def test_multiple_join(self):
         with self.assertQueryCount(1):
-            FavUser = User._meta.table.alias('fav_user')
+            FavUser = User.alias('fav_user')
             query = (Favorite
                      .select(Favorite, Tweet, User, FavUser.username)
                      .join(Favorite.tweet)
@@ -940,7 +1098,7 @@ class TestJoins(ModelTestCase):
         gc12 = Category.create(name='gc1-2', parent=c1)
 
         with self.assertQueryCount(1):
-            Parent = Category._meta.table.alias('parent')
+            Parent = Category.alias('parent')
             query = (Category
                      .select(Category, Parent.id, Parent.name)
                      .join(
@@ -948,11 +1106,17 @@ class TestJoins(ModelTestCase):
                          Parent,
                          (Category.parent == Parent.id).alias('parent'),
                          'LEFT OUTER')
-                     .where(Category.parent.is_null(False))
                      .order_by(Category.id))
             results = []
             for category in query:
                 results.append((category.name, category.parent.name))
+
+            self.assertEqual(results, [
+                ('root', None),
+                ('c1', 'root'),
+                ('c2', 'root'),
+                ('gc1-1', 'c1'),
+                ('gc1-2', 'c1')])
 
 
 class TestFullTextSearch(BaseTestCase):
@@ -987,28 +1151,19 @@ class TestFullTextSearch(BaseTestCase):
 
     def setUp(self):
         super(TestFullTextSearch, self).setUp()
-        Post.drop_table(True)
-        Post.create_table()
-        User.drop_table(True)
-        User.create_table()
-        AutoFTSUser.drop_table(True)
-        AutoFTSUser.create_table()
-        MultiColumn.drop_table(True)
-        MultiColumn.create_table()
+        test_db.drop_tables([Post, User, AutoFTSUser, MultiColumn], safe=True)
+        test_db.create_tables([Post, User, AutoFTSUser, MultiColumn])
         for idx, message in enumerate(self.messages):
             Post.create(idx=idx, content=message)
 
     def tearDown(self):
-        Post.drop_table(True)
-        AutoFTSUser.drop_table(True)
-        User.drop_table(True)
-        MultiColumn.drop_table(True)
+        test_db.drop_tables([Post, User, AutoFTSUser, MultiColumn])
         super(TestFullTextSearch, self).tearDown()
 
     def assertMessages(self, query, indices):
         self.assertEqual(
-            [x.content for x in query],
-            [self.messages[i] for i in indices])
+            [row.content for row in query],
+            [self.messages[index] for index in indices])
 
     def test_search(self):
         query = (Post
@@ -1286,7 +1441,6 @@ class TestDeclarative(BaseTestCase):
             ['content'])
         self.assertEqual(FTSNote().foo(), 'foo3')
 
-
     def test_sorting_models(self):
         class Base(Declarative):
             class Meta:
@@ -1304,6 +1458,397 @@ class TestDeclarative(BaseTestCase):
         models = [F, A, B, C, D, E]
         accum = test_db.sort_models(models)
         self.assertEqual(accum, [A, B, C, D, E, F])
+
+
+class TestCursorWrappers(ModelTestCase):
+    MODELS = [User, Tweet, Comment, Category]
+
+    def setUp(self):
+        super(TestCursorWrappers, self).setUp()
+        data = (
+            ('huey', 3),
+            ('mickey', 1),
+            ('zaizee', 0))
+        for username, ntweets in data:
+            user = User.create(username=username)
+            for i in range(ntweets):
+                Tweet.create(content='%s-%s' % (username, i), user=user)
+
+        self.basic = User.select().order_by(User.username)
+        self.tweet_join = (Tweet
+                           .select(Tweet.content, User.username)
+                           .join(Tweet.user)
+                           .order_by(User.username, Tweet.id))
+        self.aggregate = (User
+                          .select(User, fn.COUNT(Tweet.id).alias('count'))
+                          .join(User.tweets)
+                          .group_by(User)
+                          .order_by(fn.COUNT(Tweet.id)))
+        self.tables = (Tweet
+                       .select(Tweet.content, UserTbl.username)
+                       .join(Tweet, UserTbl, (Tweet.user == UserTbl.id))
+                       .order_by(UserTbl.username, Tweet.id))
+
+        self.basic_data = [
+            (1, 'huey'),
+            (2, 'mickey'),
+            (3, 'zaizee')]
+        self.tweet_join_data = [
+            ('huey-0', 'huey'),
+            ('huey-1', 'huey'),
+            ('huey-2', 'huey'),
+            ('mickey-0', 'mickey')]
+        self.aggregate_data = [
+            (3, 'zaizee', 0),
+            (2, 'mickey', 1),
+            (1, 'huey', 3)]
+        self.tables_data = [
+            ('huey-0', 'huey'),
+            ('huey-1', 'huey'),
+            ('huey-2', 'huey'),
+            ('mickey-0', 'mickey')]
+
+    def assertResults(self, query, tuple_data, row_transform=None):
+        row_transform = row_transform or (lambda x: x)
+        with self.assertQueryCount(1):
+            data = [row_transform(row) for row in query]
+            self.assertEqual(data, tuple_data)
+
+    def _test_wrapper(self, qwrap=None, transform=None, transform_args=None):
+        identity = lambda x: x
+        qwrap = qwrap or identity
+        transform = transform or (lambda *args: identity)
+        transform_args = transform_args or [(), (), (), ()]
+
+        self.assertResults(
+            qwrap(self.basic),
+            self.basic_data,
+            transform(*transform_args[0]))
+        self.assertResults(
+            qwrap(self.tweet_join),
+            self.tweet_join_data,
+            transform(*transform_args[1]))
+        self.assertResults(
+            qwrap(self.aggregate),
+            self.aggregate_data,
+            transform(*transform_args[2]))
+        self.assertResults(
+            qwrap(self.tables),
+            self.tables_data,
+            transform(*transform_args[3]))
+
+    def test_tuples(self):
+        self._test_wrapper(lambda query: query.tuples())
+
+    def test_dicts(self):
+        def dict_to_tuple(*keys):
+            def transform(row):
+                return tuple([row[key] for key in keys])
+            return transform
+        self._test_wrapper(
+            lambda query: query.dicts(),
+            dict_to_tuple,
+            [('id', 'username'),
+             ('content', 'username'),
+             ('id', 'username', 'count'),
+             ('content', 'username')])
+
+    def test_namedtuples(self):
+        self._test_wrapper(lambda query: query.namedtuples())
+
+    def test_constructor(self):
+        def obj_to_tuple(*attrs):
+            def transform(row_obj):
+                return tuple([getattr(row_obj, attr) for attr in attrs])
+            return transform
+
+        class FakeModel(Declarative):
+            pass
+
+        self._test_wrapper(
+            lambda query: query.constructor(FakeModel),
+            obj_to_tuple,
+            [('id', 'username'),
+             ('content', 'username'),
+             ('id', 'username', 'count'),
+             ('content', 'username')])
+
+    def test_models(self):
+        def model_to_tuple(ModelClass, *paths):
+            def resolve_path(obj, path):
+                if not path:
+                    return obj
+                parts = path.split('.', 1)
+                obj = getattr(obj, parts[0])
+                return resolve_path(obj, '.'.join(parts[1:]))
+
+            def transform(row_obj):
+                self.assertTrue(isinstance(row_obj, ModelClass))
+                accum = []
+                return tuple([resolve_path(row_obj, path) for path in paths])
+            return transform
+
+        self._test_wrapper(
+            None,
+            model_to_tuple,
+            [(User, 'id', 'username'),
+             (Tweet, 'content', 'user.username'),
+             (User, 'id', 'username', 'count'),
+             (Tweet, 'content', 'user.username')])
+
+    def test_row_cache(self):
+        huey, mickey, zaizee = User.select().order_by(User.id)
+
+        with self.assertQueryCount(1):
+            query = User.select().order_by(User.id)
+            wrapper = query.execute()
+
+            self.assertFalse(wrapper.populated)
+            self.assertEqual(wrapper.row_cache, [])
+
+            wrapper.fill_cache(1)
+            self.assertFalse(wrapper.populated)
+            self.assertEqual(wrapper.row_cache, [huey])
+
+            wrapper.fill_cache(3)
+            self.assertFalse(wrapper.populated)
+            self.assertEqual(wrapper.row_cache, [huey, mickey, zaizee])
+
+            wrapper.fill_cache(4)
+            self.assertTrue(wrapper.populated)
+            self.assertEqual(wrapper.row_cache, [huey, mickey, zaizee])
+
+        with self.assertQueryCount(1):
+            query = User.select().order_by(User.id)
+            wrapper = query.execute()
+
+            self.assertEqual(wrapper[0], huey)
+            self.assertEqual(wrapper[-1], zaizee)
+            self.assertEqual(wrapper[0:3], [huey, mickey, zaizee])
+            self.assertEqual(wrapper[0:3:2], [huey, zaizee])
+            self.assertEqual(wrapper[:2], [huey, mickey])
+            self.assertEqual(wrapper[1:], [mickey, zaizee])
+            self.assertEqual(wrapper[4:], [])
+            self.assertRaises(IndexError, lambda: wrapper[4])
+
+    def test_iteration(self):
+        nums = range(1, 11)
+        for i in nums:
+            Category.create(name='c%s' % i)
+
+        with self.assertQueryCount(1):
+            query = Category.select()
+            wrapper = query.execute()
+
+            first_five = []
+            for i, c in enumerate(wrapper):
+                first_five.append(c.name)
+                if i == 4:
+                    break
+
+            self.assertEqual(first_five, ['c1', 'c2', 'c3', 'c4', 'c5'])
+
+            # Performing another iteration instantiates a new ResultIterator
+            # object pointing at index 0. The iterator will yield from the
+            # result cache until it runs out, then pull from the cursor.
+            another_iter = [c.name for c in wrapper]
+            self.assertEqual(another_iter, ['c%s' % i for i in nums])
+
+            another_iter = [c.name for c in wrapper]
+            self.assertEqual(another_iter, ['c%s' % i for i in nums])
+
+    def test_iteration_protocol(self):
+        huey, mickey, zaizee = User.select().order_by(User.id)
+
+        with self.assertQueryCount(1):
+            query = User.select().order_by(User.id)
+            wrapper = query.execute()
+            wrapper_id = id(wrapper)
+
+            it = iter(wrapper)
+            for user in it:
+                pass
+
+            self.assertEqual(wrapper.row_cache, [huey, mickey, zaizee])
+
+            self.assertRaises(StopIteration, next, it)
+            self.assertEqual(list(it), [])
+
+            it = iter(wrapper)
+            self.assertEqual(
+                [user.username for user in it],
+                ['huey', 'mickey', 'zaizee'])
+            self.assertRaises(StopIteration, next, it)
+
+            wrapper_2 = query.execute()
+            self.assertEqual(wrapper_id, id(wrapper_2))
+
+            self.assertEqual(query[0].username, 'huey')
+            self.assertEqual(query[2].username, 'zaizee')
+            self.assertEqual(query[::2], [huey, zaizee])
+
+    def test_one_pass_iterators(self):
+        with self.assertQueryCount(1):
+            query = User.select().order_by(User.id)
+            it = query.iterator()
+            wrapper = query.execute()
+
+            usernames = [user.username for user in it]
+            self.assertEqual(usernames, ['huey', 'mickey', 'zaizee'])
+            self.assertEqual(wrapper.row_cache, [])
+            self.assertTrue(wrapper.populated)
+            self.assertEqual(list(it), [])
+            self.assertEqual(list(wrapper.iterator()), [])
+
+        with self.assertQueryCount(0):
+            again = [u.username for u in query.iterator()]
+            self.assertEqual(again, [])
+
+    def test_select_multiple(self):
+        huey, mickey, zaizee = User.select().order_by(User.id)
+
+        # Huey has one comment on his first and third tweet.
+        for i, tweet in enumerate(huey.tweets):
+            if i % 2 == 0:
+                Comment.create(tweet=tweet, comment='c-%s' % tweet.content)
+
+        # Mickey has 4 comments on his single tweet.
+        for tweet in mickey.tweets:
+            for i in range(4):
+                Comment.create(tweet=tweet, comment='c-%s' % tweet.content)
+
+        comments = (Comment
+                    .select(Comment.comment, Tweet.id, Tweet.content)
+                    .join(Comment.tweet)
+                    .where(Tweet.user == mickey)
+                    .order_by(Comment.id))
+        expected = ['mickey-0'] * 4
+        with self.assertQueryCount(1):
+            self.assertEqual([c.tweet.content for c in comments], expected)
+
+        comments = (Comment
+                    .select(Comment.comment, Tweet.content)
+                    .join(Comment.tweet)
+                    .where(Tweet.user == mickey)
+                    .order_by(Comment.id))
+        with self.assertQueryCount(1):
+            self.assertEqual([c.tweet.content for c in comments], expected)
+
+        comments = (Comment
+                    .select(Comment, Tweet, User)
+                    .join(Comment.tweet)
+                    .join(Tweet.user)
+                    .where(User.username == 'huey')
+                    .order_by(Comment.id))
+        with self.assertQueryCount(1):
+            self.assertEqual(
+                [c.comment for c in comments],
+                ['c-huey-0', 'c-huey-2'])
+            self.assertEqual(
+                [c.tweet.content for c in comments],
+                ['huey-0', 'huey-2'])
+            self.assertEqual(
+                [c.tweet.user.username for c in comments],
+                ['huey', 'huey'])
+
+        with self.assertQueryCount(1):
+            comments = comments.select(Comment.id, Tweet.id, User.username)
+            self.assertEqual(
+                [c.tweet.user.username for c in comments],
+                ['huey', 'huey'])
+
+        comments = (Comment
+                    .select(Comment, Tweet, User)
+                    .join(
+                        Comment,
+                        Tweet,
+                        (Comment.tweet == Tweet.id).alias('tx'))
+                    .join(
+                        Tweet,
+                        User,
+                        (Tweet.user == User.id).alias('ux'))
+                    .where(User.username == 'huey')
+                    .order_by(Comment.id))
+        with self.assertQueryCount(1):
+            self.assertEqual(
+                [c.comment for c in comments],
+                ['c-huey-0', 'c-huey-2'])
+            self.assertEqual(
+                [c.tx.content for c in comments],
+                ['huey-0', 'huey-2'])
+            self.assertEqual(
+                [c.tx.ux.username for c in comments],
+                ['huey', 'huey'])
+
+        with self.assertQueryCount(1):
+            comments = comments.constructor(Comment)
+            self.assertEqual(
+                [c.comment for c in comments],
+                ['c-huey-0', 'c-huey-2'])
+            self.assertEqual(
+                [c.content for c in comments],
+                ['huey-0', 'huey-2'])
+            self.assertEqual(
+                [c.username for c in comments],
+                ['huey', 'huey'])
+
+    def test_type_conversion(self):
+        query = UpperUser.select().order_by(UpperUser.id)
+        self.assertEqual(
+            [user.username for user in query],
+            ['HUEY', 'MICKEY', 'ZAIZEE'])
+
+        query = query.select(UpperUser.username.alias('foo'))
+        self.assertEqual(
+            [user.foo for user in query],
+            ['HUEY', 'MICKEY', 'ZAIZEE'])
+
+    def test_type_conversion_aggregate(self):
+        base = UpperUser.select(fn.MAX(UpperUser.username))
+
+        max_username = base.scalar(convert=True)
+        self.assertEqual(max_username, 'ZAIZEE')
+
+        # Detect the column name of the function call matches a field.
+        Tbl = UpperUser._meta.table
+        max_username = (base
+                        .select(fn.MAX(Tbl.username))
+                        .scalar(convert=True))
+        self.assertEqual(max_username, 'ZAIZEE')
+
+        # Indicate the function should not allow the value to be altered.
+        max_username = (base
+                        .select(fn.MAX(UpperUser.username).coerce(False))
+                        .scalar(convert=True))
+        self.assertEqual(max_username, 'zaizee')
+
+        # Call `scalar()` without specifying value conversion.
+        max_username = base.scalar()
+        self.assertEqual(max_username, 'zaizee')
+
+    def test_type_conversion_function(self):
+        substr = fn.SUBSTR(UpperUser.username, 1, 3)
+
+        def assertNames(query, expected, attr='username'):
+            return self.assertEqual(
+                [getattr(obj, attr) for obj in query.order_by(UpperUser.id)],
+                expected)
+
+        assertNames(
+            UpperUser.select(substr.alias('foo')),
+            ['HUE', 'MIC', 'ZAI'],
+            'foo')
+
+        # Because it's named `username`, we get the default converter.
+        assertNames(
+            UpperUser.select(substr.coerce(False).alias('username')),
+            ['HUE', 'MIC', 'ZAI'])
+
+        # Because it's named `username`, we get the default converter.
+        assertNames(
+            UpperUser.select(substr.coerce(False).alias('bar')),
+            ['hue', 'mic', 'zai'],
+            'bar')
 
 
 if __name__ == '__main__':
