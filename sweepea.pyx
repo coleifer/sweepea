@@ -1,10 +1,14 @@
 from cpython cimport datetime
 import hashlib
 import logging
+import math
 import operator
+import re
+import struct
 import threading
 import uuid
 from collections import namedtuple
+from copy import copy
 from inspect import isclass
 
 import apsw
@@ -26,14 +30,33 @@ cdef class _callable_context_manager(object):
         return inner
 
 
-class Database(object):
-    def __init__(self, filename=':memory:', pragmas=None, **kwargs):
+cdef class Database(object):
+    cdef:
+        basestring filename
+        bint rank_functions
+        dict _aggregates, _collations, _functions, _modules
+        dict connect_params
+        object _local, _lock
+        readonly QueryBuilder query_builder
+        tuple pragmas
+
+    def __init__(self, filename=':memory:', pragmas=None, rank_functions=True,
+                 **kwargs):
         self.filename = filename
         self.pragmas = pragmas or ()
+        self.rank_functions = rank_functions
         self.connect_params = kwargs
         self._local = _ConnectionLocal()
         self._lock = threading.Lock()
         self.query_builder = QueryBuilder()
+        self._aggregates = {}
+        self._collations = {}
+        self._functions = {}
+        self._modules = {}
+
+        if self.rank_functions:
+            self.func('rank')(rank)
+            self.func('bm25')(bm25)
 
     def __enter__(self):
         """
@@ -72,7 +95,7 @@ class Database(object):
                 return fn(*args, **kwargs)
         return inner
 
-    def connect(self):
+    cpdef connect(self):
         """
         Open a connection to the database. The connection will be initialized
         using the ``_initialize_connection`` method, which sets ``PRAGMAs``,
@@ -94,14 +117,77 @@ class Database(object):
             self._initialize_connection(self._local.conn)
         return True
 
-    def _initialize_connection(self, conn):
+    cpdef _initialize_connection(self, conn):
+        cdef:
+            basestring pragma
+            object cursor, value
+
         if self.pragmas:
             cursor = conn.cursor()
             for pragma, value in self.pragmas:
                 cursor.execute('PRAGMA %s = %s;' % (pragma, value))
             cursor.close()
+        self._load_aggregates(conn)
+        self._load_collations(conn)
+        self._load_functions(conn)
+        self._load_modules(conn)
 
-    def close(self):
+    def _load_aggregates(self, conn):
+        for name, (klass, num_params) in self._aggregates.items():
+            def make_aggregate():
+                instance = klass()
+                return (instance, instance.step, instance.finalize)
+            conn.createaggregatefunction(name, make_aggregate)
+
+    cpdef _load_collations(self, conn):
+        cdef:
+            basestring name
+            object fn
+
+        for name, fn in self._collations.items():
+            conn.createcollation(name, fn)
+
+    cpdef _load_functions(self, conn):
+        cdef:
+            basestring name
+            int num_params
+            object fn
+
+        for name, (fn, num_params) in self._functions.items():
+            conn.createscalarfunction(name, fn, num_params)
+
+    cpdef _load_modules(self, conn):
+        cdef:
+            basestring name
+            object inst
+
+        for name, inst in self._modules.items():
+            conn.createmodule(name, inst)
+
+    def aggregate(self, name=None, num_params=-1):
+        def decorator(klass):
+            self._aggregates[name or klass.__name__] = (klass, num_params)
+            return klass
+        return decorator
+
+    def collation(self, name=None):
+        def decorator(fn):
+            self._collations[name or fn.__name__] = fn
+        return decorator
+
+    def func(self, name=None, num_params=-1):
+        def decorator(fn):
+            self._functions[name or fn.__name__] = (fn, num_params)
+            return fn
+        return decorator
+
+    def module(self, name=None):
+        def decorator(obj):
+            self._modules[name or type(obj).__name__] = obj
+            return obj
+        return decorator
+
+    cpdef bint close(self):
         """
         Close the currently open connection. If no connection is open the
         function is a no-op.
@@ -116,7 +202,10 @@ class Database(object):
                 return True
             return False
 
-    def connection(self):
+    cpdef bint is_closed(self):
+        return self._local.closed == True
+
+    cpdef connection(self):
         """
         Returns a connection to the database, creating one if one does not
         already exist.
@@ -127,19 +216,20 @@ class Database(object):
             self.connect()
         return self._local.conn
 
-    def cursor(self):
+    cpdef cursor(self):
         """
         Returns a cursor on the current connection. If no connection is
         currently open, one will be created.
 
         :returns: A cursor.
         """
+        cdef object local
         local = self._local
         if local.closed:
             self.connect()
         return local.conn.cursor()
 
-    def execute_sql(self, sql, params=None):
+    cpdef execute_sql(self, basestring sql, tuple params=None):
         """
         Execute a SQL query, returning a cursor that can be used to iterate
         over any results, or retrieve the number of rows modified, etc.
@@ -148,44 +238,46 @@ class Database(object):
 
         :returns: A cursor.
         """
+        cdef object cursor
+
         cursor = self.cursor()
         cursor.execute(sql, params or ())
         return cursor
 
-    def execute(self, clause):
+    cpdef execute(self, clause):
         return self.execute_sql(*self.query_builder.build_query(clause))
 
-    def last_insert_id(self, cursor):
+    cpdef last_insert_id(self, cursor):
         """
         Retrieve the primary key of the most-recently inserted row on this
         connection.
         """
         return cursor.getconnection().last_insert_rowid()
 
-    def rows_affected(self, cursor):
+    cpdef rows_affected(self, cursor):
         """
         Retrieve the number of rows affected by the most recently executed
         data-modifying query on this connection.
         """
         return cursor.getconnection().changes()
 
-    def get_autocommit(self):
+    cpdef bint get_autocommit(self):
         """
         Return a boolean indicating whether the underlying connection is in
         autocommit mode.
         """
         return self.connection().getautocommit()
 
-    def push_transaction(self, transaction):
+    cpdef push_transaction(self, _transaction transaction):
         self._local.transactions.append(transaction)
 
-    def pop_transaction(self):
+    cpdef pop_transaction(self):
         self._local.transactions.pop()
 
-    def transaction_depth(self):
+    cpdef int transaction_depth(self):
         return len(self._local.transactions)
 
-    def atomic(self):
+    cpdef _atomic atomic(self):
         """
         Execute statements in either a transaction or a savepoint. The
         outer-most call to *atomic* will use a transaction, and any subsequent
@@ -202,7 +294,7 @@ class Database(object):
         """
         return _atomic(self)
 
-    def transaction(self):
+    cpdef _transaction transaction(self):
         """
         Execute statements in a transaction using either a context manager or
         decorator. If an error is raised inside the wrapped block, the
@@ -219,7 +311,7 @@ class Database(object):
         """
         return _transaction(self)
 
-    def savepoint(self):
+    cpdef _savepoint savepoint(self):
         """
         Execute statements in a savepoint using either a context manager or
         decorator. If an error is raised inside the wrapped block, the
@@ -235,7 +327,7 @@ class Database(object):
         """
         return _savepoint(self)
 
-    def begin(self, lock='DEFERRED'):
+    cpdef begin(self, basestring lock='DEFERRED'):
         """
         Begin a new transaction.
 
@@ -245,29 +337,31 @@ class Database(object):
         """
         self.cursor().execute('BEGIN %s;' % lock)
 
-    def commit(self):
+    cpdef commit(self):
         """
         Commit the currently open transaction. If no transaction is open,
         an ``apsw.SQLError`` will be raised.
         """
         self.cursor().execute('COMMIT;')
 
-    def rollback(self):
+    cpdef rollback(self):
         """
         Roll-back the currently open transaction. If no transaction is open,
         an ``apsw.SQLError`` will be raised.
         """
         self.cursor().execute('ROLLBACK;')
 
-    def get_tables(self):
+    cpdef list get_tables(self):
         """
         Returns a sorted list of tables in the database.
         """
+        cdef tuple row
+
         cursor = self.execute_sql('SELECT name FROM sqlite_master WHERE '
                                   'type = ? ORDER BY name;', ('table',))
         return [row[0] for row in cursor.fetchall()]
 
-    def get_indexes(self, table):
+    cpdef list get_indexes(self, basestring table):
         """
         Returns a list of index metadata for the given table. Index metadata
         is returned as a 4-tuple consisting of:
@@ -277,13 +371,19 @@ class Database(object):
         * Names of columns being indexed.
         * Whether the index is unique.
         """
+        cdef:
+            basestring index_name, name, query
+            bint is_unique
+            dict index_columns = {}, index_to_sql
+            set unique_indexes = set()
+            tuple row
+
         query = ('SELECT name, sql FROM sqlite_master '
                  'WHERE tbl_name = ? AND type = ? ORDER BY name')
         cursor = self.execute_sql(query, (table, 'index'))
         index_to_sql = dict(cursor.fetchall())
 
         # Determine which indexes have a unique constraint.
-        unique_indexes = set()
         cursor = self.execute_sql('PRAGMA index_list("%s")' % table)
         for row in cursor.fetchall():
             name = row[1]
@@ -292,7 +392,6 @@ class Database(object):
                 unique_indexes.add(name)
 
         # Retrieve the indexed columns.
-        index_columns = {}
         for index_name in sorted(index_to_sql):
             cursor = self.execute_sql('PRAGMA index_info("%s")' % index_name)
             index_columns[index_name] = [row[2] for row in cursor.fetchall()]
@@ -304,7 +403,7 @@ class Database(object):
             name in unique_indexes)
             for name in sorted(index_to_sql)]
 
-    def get_columns(self, table):
+    cpdef list get_columns(self, basestring table):
         """
         Returns a list of column metadata for the given table. Column
         metadata is returned as a 4-tuple consisting of:
@@ -314,18 +413,22 @@ class Database(object):
         * Whether the column can be NULL.
         * Whether the column is the primary key.
         """
+        cdef tuple row
+
         cursor = self.execute_sql('PRAGMA table_info("%s")' % table)
         return [(row[1], row[2], not row[3], bool(row[5]))
                 for row in cursor.fetchall()]
 
-    def get_primary_keys(self, table):
+    cpdef list get_primary_keys(self, basestring table):
         """
         Returns a list of column(s) that comprise the table's foreign key.
         """
+        cdef tuple row
+
         cursor = self.execute_sql('PRAGMA table_info("%s")' % table)
         return [row[1] for row in cursor.fetchall() if row[-1]]
 
-    def get_foreign_keys(self, table):
+    cpdef list get_foreign_keys(self, basestring table):
         """
         Returns a list of foreign key metadata for the given table. Foreign
         key metadata is returned as a 3-tuple consisting of:
@@ -334,6 +437,8 @@ class Database(object):
         * Destination table.
         * Destination column.
         """
+        cdef tuple row
+
         cursor = self.execute_sql('PRAGMA foreign_key_list("%s")' % table)
         return [(row[3], row[2], row[4]) for row in cursor.fetchall()]
 
@@ -386,6 +491,36 @@ class Database(object):
         """
         return DeleteQuery(self)
 
+    cdef _sort_models_dfs(self, model, set seen, set models, list accum):
+        if model in models and model not in seen:
+            seen.add(model)
+            for foreign_key in model._meta.backrefs.values():
+                self._sort_models_dfs(
+                    foreign_key.model,
+                    seen,
+                    models,
+                    accum)
+            accum.append(model)
+
+    cpdef list sort_models(self, list models):
+        cdef:
+            list ordering = []
+            object model
+            set model_set = set(models), seen = set()
+
+        for model in sorted(model_set, key=_model_sort_key, reverse=True):
+            self._sort_models_dfs(model, seen, model_set, ordering)
+
+        return ordering[::-1]
+
+    cpdef create_tables(self, list models, bint safe=True):
+        for model in self.sort_models(models):
+            model.create_table(safe=safe)
+
+    cpdef drop_tables(self, list models, bint safe=True):
+        for model in reversed(self.sort_models(models)):
+            model.drop_table(safe=safe)
+
     def __getattr__(self, name):
         """
         Magic attributes are assumed to be tables, so that ``db.tweets`` will
@@ -396,7 +531,7 @@ class Database(object):
 
 cdef class _atomic(_callable_context_manager):
     cdef:
-        object db
+        Database db
         object _helper
 
     def __init__(self, db):
@@ -415,9 +550,9 @@ cdef class _atomic(_callable_context_manager):
 
 cdef class _transaction(_callable_context_manager):
     cdef:
-        object db
         basestring lock
         bint _orig
+        Database db
 
     def __init__(self, db, lock='DEFERRED'):
         self.db = db
@@ -426,12 +561,12 @@ cdef class _transaction(_callable_context_manager):
     cpdef _begin(self):
         self.db.begin(self.lock)
 
-    cpdef commit(self, begin=True):
+    cpdef commit(self, bint begin=True):
         self.db.commit()
         if begin:
             self._begin()
 
-    cpdef rollback(self, begin=True):
+    cpdef rollback(self, bint begin=True):
         self.db.rollback()
         if begin:
             self._begin()
@@ -458,8 +593,8 @@ cdef class _transaction(_callable_context_manager):
 
 cdef class _savepoint(_callable_context_manager):
     cdef:
-        object db
         basestring sid, quoted_sid
+        Database db
 
     def __init__(self, db, sid=None):
         self.db = db
@@ -507,11 +642,24 @@ cdef returns_clone(method):
     return inner
 
 
+cdef class _CDescriptor(object):
+    def __get__(self, instance, instance_type):
+        if instance is not None:
+            if instance._alias:
+                return _BaseEntity((instance._alias,))
+            elif isinstance(instance, Entity):
+                return _BaseEntity(instance.path)
+            return _BaseEntity(())
+        return self
+
+
 cdef class Node(object):
+    """Base-class representing a node in the query tree."""
     cdef:
         public bint _negated
         public basestring _alias
 
+    c = _CDescriptor()
     node_type = 'node'
 
     def __init__(self):
@@ -521,6 +669,7 @@ cdef class Node(object):
         return type(self)()
 
     cpdef clone(self):
+        """Create a copy of the node."""
         clone_obj = self.clone_base()
         clone_obj._negated = self._negated
         clone_obj._alias = self._alias
@@ -528,6 +677,7 @@ cdef class Node(object):
 
     @returns_clone
     def alias(self, alias=None):
+        """Give the node an alias, i.e. "foo" AS "bar"."""
         self._alias = alias
 
     cpdef asc(self):
@@ -575,33 +725,33 @@ cdef class Node(object):
     def __rshift__(self, rhs):
         return Expression(self, 'IS', rhs)
 
-    def bin_and(self, rhs):
+    cpdef Expression bin_and(self, rhs):
         return Expression(self, '&', rhs)
-    def bin_or(self, rhs):
+    cpdef Expression bin_or(self, rhs):
         return Expression(self, '|', rhs)
-    def modulo(self, rhs):
+    cpdef Expression modulo(self, rhs):
         return Expression(self, '%', rhs)
-    def in_(self, rhs):
+    cpdef Expression in_(self, rhs):
         return Expression(self, 'IN', rhs)
-    def not_in(self, rhs):
+    cpdef Expression not_in(self, rhs):
         return Expression(self, 'NOT IN', rhs)
-    def is_null(self, is_null=True):
+    cpdef Expression is_null(self, is_null=True):
         op = 'IS' if is_null else 'IS NOT'
         return Expression(self, op, None)
 
-    cpdef contains(self, rhs):
+    cpdef Expression contains(self, rhs):
         return Expression(self, 'LIKE', '%%%s%%' % rhs)
-    cpdef startswith(self, rhs):
+    cpdef Expression startswith(self, rhs):
         return Expression(self, 'LIKE', '%s%%' % rhs)
-    cpdef endswith(self, rhs):
+    cpdef Expression endswith(self, rhs):
         return Expression(self, 'LIKE', '%%%s' % rhs)
-    cpdef between(self, low, high):
+    cpdef Expression between(self, low, high):
         return Expression(self, 'BETWEEN', Expression(low, 'AND', high))
-    cpdef regexp(self, rhs):
+    cpdef Expression regexp(self, rhs):
         return Expression(self, 'REGEXP', rhs)
-    cpdef concat(self, rhs):
+    cpdef Expression concat(self, rhs):
         return Expression(self, '||', rhs)
-    cpdef match(self, rhs):
+    cpdef Expression match(self, rhs):
         return Expression(self, 'MATCH', rhs)
 
     def __pos__(self):
@@ -626,6 +776,7 @@ cdef class _Ordering(Node):
     node_type = 'ordering'
 
     def __init__(self, node):
+        super(_Ordering, self).__init__()
         self.node = node
 
     cdef clone_base(self):
@@ -641,6 +792,7 @@ cdef class Desc(_Ordering):
 
 
 cdef class Expression(Node):
+    """A binary expression, consisting of an LHS, operand, and RHS."""
     cdef:
         readonly object lhs
         readonly object rhs
@@ -663,17 +815,21 @@ cdef class Expression(Node):
         return Expression(self.lhs, self.op, self.rhs, self.flat)
 
 
-cdef class Entity(Node):
+cdef class _BaseEntity(Node):
     cdef:
         readonly tuple path
         readonly basestring str_path
 
+    c = None  # No magic descriptor on base entity to avoid confusion.
     node_type = 'entity'
 
     def __init__(self, path):
-        super(Entity, self).__init__()
+        super(_BaseEntity, self).__init__()
         self.path = path
         self.str_path = '.'.join('"%s"' % p for p in self.path)
+
+    cdef clone_base(self):
+        return type(self)(self.path)
 
     def __repr__(self):
         return '<Entity: %s>' % self.str_path
@@ -685,34 +841,37 @@ cdef class Entity(Node):
         return Expression(self, comparison_map[operation], rhs)
 
     def __getattr__(self, name):
+        if self._alias:
+            return Entity((self._alias, name))
         return Entity(self.path + (name,))
 
-    cdef clone_base(self):
-        return type(self)(self.path)
+    cdef Table table(self):
+        return Table(self.path[:1]) if len(self.path) > 1 else None
 
     cdef Entity tail(self):
         return Entity((self.path[-1],))
 
 
-cdef class Table(Entity):
-    cdef:
-        dict columns
-
-    def __init__(self, path):
-        super(Table, self).__init__(path)
-        self.columns = {}  # Keep a cache of column instances handy.
+cdef class Entity(_BaseEntity):
+    """A quoted-name."""
+    c = _CDescriptor()
 
     def __getattr__(self, name):
-        key = (self._alias, name)
-        if key not in self.columns:
-            if self._alias:
-                self.columns[key] = Entity((self._alias, name))
-            else:
-                self.columns[key] = Entity(self.path + (name,))
-        return self.columns[key]
+        raise AttributeError(name)
+
+
+cdef class Table(_BaseEntity):
+    def __repr__(self):
+        return '<Table: %s>' % self.str_path
+
+    cdef Table table(self):
+        if self._alias:
+            return Table((self._alias,))
+        return self
 
 
 cdef class SQL(Node):
+    """A SQL string and any arbitrary bind params."""
     cdef:
         basestring sql
         tuple params
@@ -734,6 +893,7 @@ cdef class SQL(Node):
 
 
 cdef class Function(Node):
+    """A call to a SQL or user-defined function or aggregate."""
     cdef:
         readonly basestring name
         readonly tuple arguments
@@ -764,6 +924,10 @@ fn = Function(None, None)
 
 
 cdef class Clause(Node):
+    """
+    One or more Nodes joined by the given string, optionally wrapped in
+    parentheses.
+    """
     cdef:
         basestring glue
         bint parens
@@ -844,7 +1008,12 @@ cdef class QueryBuilder(object):
         try:
             node_type = node.node_type
         except AttributeError:
-            sql, params = ('?', (node,))
+            if isinstance(node, list):
+                # Techincally shouldn't reach this code.
+                sql = '(%s)' % ', '.join('?' * len(node))
+                params = tuple(node)
+            else:
+                sql, params = ('?', (node,))
         else:
             # Differentiate between model classes and model instances.
             is_model = node_type == 'model'
@@ -868,7 +1037,7 @@ cdef class QueryBuilder(object):
                 if node._alias:
                     sql = ' '.join((sql, 'AS', node._alias))
 
-        if converter:
+        if converter and params:
             params = tuple(map(converter, params))
 
         return sql, params
@@ -883,12 +1052,21 @@ cdef class QueryBuilder(object):
         return sql.sql, sql.params
 
     cdef tuple parse_expression(self, Expression expr, converter):
-        cdef basestring lhs, rhs
-        cdef tuple largs, rargs
+        cdef:
+            basestring lhs, rhs
+            tuple largs, rargs
+
+        if expr.op in ('IN', 'NOT IN') and isinstance(expr.rhs, (tuple, list)):
+            rhs_node = EnclosedClause(expr.rhs)
+        else:
+            rhs_node = expr.rhs
+
         if isinstance(expr.lhs, Field):
             converter = expr.lhs.db_value
+
         lhs, largs = self.parse_node(expr.lhs, converter)
         rhs, rargs = self.parse_node(expr.rhs, converter)
+
         if expr.flat:
             return ('%s %s %s' % (lhs, expr.op, rhs), largs + rargs)
         else:
@@ -898,14 +1076,14 @@ cdef class QueryBuilder(object):
         cdef list param_sql = []
         cdef tuple param_accum = (), tmp_params = ()
         cdef basestring tmp_sql
-        cdef Node argument
+        cdef object argument
         for argument in func.arguments:
             tmp_sql, tmp_params = self.parse_node(argument, converter)
             param_sql.append(tmp_sql)
             param_accum += tmp_params
         return ('%s(%s)' % (func.name, ', '.join(param_sql)), param_accum)
 
-    cdef tuple parse_entity(self, Entity entity, converter):
+    cdef tuple parse_entity(self, _BaseEntity entity, converter):
         return entity.str_path, ()
 
     cdef tuple parse_field(self, Field field, converter):
@@ -1026,11 +1204,14 @@ cdef class DictCursorWrapper(CursorWrapper):
         list columns
         int ncols
 
-    cdef initialize(self):
+    cdef _initialize_columns(self):
         cdef tuple description = self.cursor.getdescription()
         self.columns = [t[0][t[0].find('.') + 1:]
                         for t in description]
         self.ncols = len(description)
+
+    cdef initialize(self):
+        self._initialize_columns()
 
     cdef dict _row_to_dict(self, tuple row):
         cdef:
@@ -1171,7 +1352,7 @@ cpdef Clause select(selection, from_list=None, joins=None, where=None,
 cdef tuple simple_key(key, model):
     cdef Field field = None
 
-    if isinstance(key, Entity):
+    if isinstance(key, _BaseEntity):
         key = key.path[-1]
 
     if model and key in model._meta.combined:
@@ -1223,7 +1404,7 @@ cpdef Clause update(table, values, where=None, limit=None, on_conflict=None,
     return Clause(parts)
 
 
-cpdef Clause insert(values, table, on_conflict=None, model=None):
+cpdef Clause insert(values, table, columns=None, on_conflict=None, model=None):
     """
     Low-level function to construct an ``INSERT`` query.
 
@@ -1249,8 +1430,18 @@ cpdef Clause insert(values, table, on_conflict=None, model=None):
         parts.append(SQL('INSERT INTO'))
 
     parts.append(table)
-    if isinstance(values, Clause):
+    if isinstance(values, (Clause, SelectQuery)):
         # Assume values is a query.
+        if columns is not None:
+            for col in columns:
+                if isinstance(col, Field):
+                    col = col.column
+                if not isinstance(col, _BaseEntity):
+                    col = Entity(col)
+                else:
+                    col = (<Entity>col).tail()
+                clean_fields.append(col)
+            parts.append(EnclosedClause(clean_fields))
         parts.append(values)
         return Clause(parts)
 
@@ -1408,7 +1599,7 @@ cdef class Query(Node):
 cdef class SelectQuery(Query):
     cdef:
         CursorWrapper cursor_wrapper
-        public bint _distinct, _dicts, _namedtuples
+        public bint _distinct, _dicts, _namedtuples, _tuples
         public dict _joins
         public int _limit, _offset
         public list _select, _from, _group_by, _order_by
@@ -1427,6 +1618,7 @@ cdef class SelectQuery(Query):
         self._distinct = False
         self._dicts = False
         self._namedtuples = False
+        self._tuples = False
         self.cursor_wrapper = None
         if model is not None:
             self._from = [model._meta.table]
@@ -1449,6 +1641,7 @@ cdef class SelectQuery(Query):
         query._distinct = self._distinct
         query._dicts = self._dicts
         query._namedtuples = self._namedtuples
+        query._tuples = self._tuples
         return query
 
     @returns_clone
@@ -1462,20 +1655,30 @@ cdef class SelectQuery(Query):
         self._from = list(sources)
 
     @returns_clone
-    def join(self, src, dest=None, expr=None, join_type='INNER'):
+    def join(self, src, dest=None, expr=None, join_type=None):
         # Allow for flexibility in what types of values are accepted here.
         if isinstance(src, ForeignKeyField):
             self._joins.setdefault(src.model, [])
             self._joins[src.model].append((
                 src.rel_model,
                 (src == src.rel_field).alias(src.name),
-                join_type))
+                join_type or 'INNER'))
+        elif isinstance(src, BackrefDescriptor):
+            self._joins.setdefault(src.field.rel_model, [])
+            self._joins[src.field.rel_model].append((
+                src.rel_model,
+                (src.field.rel_field == src.field).alias(
+                    src.rel_model._meta.name),
+                join_type or 'LEFT OUTER',
+            ))
         elif src is not None and dest is not None:
             self._joins.setdefault(src, [])
             if expr is None:
                 # If src is Tweet and dest is User...
                 for field_name, foreign_key in src._meta.refs.items():
                     if foreign_key.rel_model == dest:
+                        if join_type is None:
+                            join_type = 'INNER'
                         expr = (foreign_key == foreign_key.rel_field)
                         expr = expr.alias(foreign_key.name)
                         break
@@ -1483,6 +1686,8 @@ cdef class SelectQuery(Query):
                 # If src is User and dest is Tweet...
                 for backref, foreign_key in src._meta.backrefs.items():
                     if foreign_key.model == dest:
+                        if join_type is None:
+                            join_type = 'LEFT OUTER'
                         expr = (foreign_key.rel_field == foreign_key)
                         expr = expr.alias(dest._meta.name)
                         break
@@ -1490,7 +1695,7 @@ cdef class SelectQuery(Query):
             self._joins[src].append((
                 dest,
                 expr,
-                join_type))
+                join_type or 'INNER'))
         else:
             raise ValueError('Insufficient data to perform join.')
 
@@ -1533,6 +1738,10 @@ cdef class SelectQuery(Query):
     def namedtuples(self, namedtuples=True):
         self._namedtuples = namedtuples
 
+    @returns_clone
+    def tuples(self, tuples=True):
+        self._tuples = tuples
+
     cpdef _aggregate(self, Node aggregation=None):
         if aggregation is None:
             aggregation = fn.Count(SQL('*'))
@@ -1569,7 +1778,8 @@ cdef class SelectQuery(Query):
         except StopIteration:
             raise DoesNotExist
 
-    def first(self):
+    cpdef first(self):
+        cdef CursorWrapper res
         res = self.execute()
         res.fill_cache(1)
         try:
@@ -1615,6 +1825,8 @@ cdef class SelectQuery(Query):
         else:
             if self._dicts:
                 return DictCursorWrapper(self._execute())
+            elif self._tuples:
+                return CursorWrapper(self._execute())
             elif self._namedtuples:
                 return NamedTupleCursorWrapper(self._execute())
             return self.get_default_cursor_wrapper()
@@ -1626,6 +1838,7 @@ cdef class SelectQuery(Query):
         return iter(self.execute().iterator())
 
     def __getitem__(self, value):
+        cdef CursorWrapper res
         res = self.execute()
         if isinstance(value, slice):
             index = value.stop
@@ -1635,6 +1848,9 @@ cdef class SelectQuery(Query):
             index += 1
         res.fill_cache(index)
         return res.row_cache[value]
+
+    def __hash__(self):
+        return id(self)
 
 
 cdef class UpdateQuery(Query):
@@ -1674,6 +1890,14 @@ cdef class UpdateQuery(Query):
         self._update = values
 
     @returns_clone
+    def limit(self, lim):
+        self._limit = lim
+
+    @returns_clone
+    def offset(self, off):
+        self._offset = off
+
+    @returns_clone
     def on_conflict(self, action=None):
         self._on_conflict = action
 
@@ -1696,7 +1920,7 @@ cdef class InsertQuery(Query):
     cdef:
         public dict _field_dict
         public SelectQuery _query
-        public list _rows
+        public list _columns, _rows
         public Table _table
         public basestring _on_conflict
 
@@ -1704,6 +1928,7 @@ cdef class InsertQuery(Query):
         super(InsertQuery, self).__init__(database, model)
         self._field_dict = None
         self._query = None
+        self._columns = None
         self._rows = None
         self._table = None
         self._on_conflict = None
@@ -1716,12 +1941,18 @@ cdef class InsertQuery(Query):
             query._field_dict = dict(self._field_dict)
         if self._query is not None:
             query._query = self._query
+        if self._columns is not None:
+            query._columns = self._columns
         if self._rows is not None:
             query._rows = self._rows
         if self._table is not None:
             query._table = self._table
         query._on_conflict = self._on_conflict
         return query
+
+    @returns_clone
+    def columns(self, *columns):
+        self._columns = self._model_shorthand(columns)
 
     @returns_clone
     def values(self, field_dict=None, rows=None, query=None):
@@ -1756,7 +1987,12 @@ cdef class InsertQuery(Query):
             values = self._query
         else:
             raise ValueError('No data to insert.')
-        query = insert(values, self._table, self._on_conflict, self.model)
+        query = insert(
+            values,
+            self._table,
+            self._columns,
+            self._on_conflict,
+            self.model)
         return self.qb.build_query(query)
 
     def execute(self):
@@ -1768,7 +2004,7 @@ cdef class DeleteQuery(Query):
         public Table _table
         public int _limit, _offset
 
-    def __init__(self, database, model):
+    def __init__(self, database, model=None):
         super(DeleteQuery, self).__init__(database, model)
         self._table = None
         self._limit = 0
@@ -1787,6 +2023,14 @@ cdef class DeleteQuery(Query):
     @returns_clone
     def from_(self, table):
         self._table = table
+
+    @returns_clone
+    def limit(self, lim):
+        self._limit = lim
+
+    @returns_clone
+    def offset(self, off):
+        self._offset = off
 
     cpdef tuple sql(self, bint nested=False):
         cdef Clause query
@@ -1808,19 +2052,22 @@ cdef int field_order = 0
 cdef class Field(Node):
     cdef:
         basestring column_name
+        dict field_kwargs
         object default
-        readonly basestring name, sort_key
-        readonly bint null, index, unique, primary_key
+        readonly basestring name
+        readonly bint null, index, unique, primary_key, unindexed
         readonly Entity column
         readonly field_order
         readonly list constraints
         readonly Model model
+        readonly tuple sort_key
 
     field_type = ''
     node_type = 'field'
 
     def __init__(self, null=False, index=False, unique=False, default=None,
-                 column=None, primary_key=False, constraints=None):
+                 column=None, primary_key=False, constraints=None,
+                 unindexed=False, **kwargs):
         global field_order
         self.null = null
         self.index = index
@@ -1829,13 +2076,34 @@ cdef class Field(Node):
         self.column_name = column
         self.primary_key = primary_key
         self.constraints = constraints
+        self.unindexed = unindexed
+        self.field_kwargs = kwargs
 
         self.model = None
         self.column = None
         self.name = ''
         field_order += 1
         self.field_order = field_order
-        self.sort_key = '%s%s' % (primary_key and 1 or 2, field_order)
+        self.sort_key = (primary_key and 1 or 2, field_order)
+
+    def __copy__(self):
+        return self.clone()
+
+    cdef clone_base(self):
+        """Create a copy of the node."""
+        cdef dict kwargs = {}
+        if self.field_kwargs:
+            kwargs.update(self.field_kwargs)
+        return type(self)(
+            null=self.null,
+            index=self.index,
+            unique=self.unique,
+            default=self.default,
+            column=self.column_name,
+            primary_key=self.primary_key,
+            constraints=self.constraints,
+            unindexed=self.unindexed,
+            **kwargs)
 
     cpdef bind(self, model, basestring name):
         self.model = <Model>model
@@ -1882,6 +2150,8 @@ cdef class Field(Node):
         """Return a list of Node instances that defines the column."""
         cdef list ddl
         ddl = [self.as_entity(), self._ddl_column()]
+        if self.unindexed:
+            ddl.append(SQL('UNINDEXED'))
         if not self.null:
             ddl.append(SQL('NOT NULL'))
         if self.primary_key:
@@ -1894,7 +2164,7 @@ cdef class Field(Node):
         return Expression(self, comparison_map[operation], rhs)
 
     def __hash__(self):
-        return hash('field.%s.%s' % (self.model._name, self.name))
+        return hash('field.%s.%s' % (self.model._meta.name, self.name))
 
 
 cdef coerce_to_unicode(s):
@@ -1995,6 +2265,12 @@ cdef class PrimaryKeyField(IntegerField):
         super(PrimaryKeyField, self).__init__(*args, **kwargs)
 
 
+cdef class PrimaryKeyAutoIncrementField(PrimaryKeyField):
+    cdef Clause ddl(self):
+        ddl_clause = PrimaryKeyField.ddl(self)
+        return Clause(ddl_clause.nodes + (SQL('AUTOINCREMENT'),))
+
+
 cdef class Model  # Forward declaration.
 
 
@@ -2003,15 +2279,28 @@ cdef class ForeignKeyField(Field):
         readonly object rel_model
         readonly Field rel_field
         basestring backref
+        bint self_referential
 
     def __init__(self, model, field=None, backref=None, *args, **kwargs):
-        if model is not None:
-            self.rel_model = model
+        self.self_referential = model == 'self'
+        kwargs['index'] = True
+
+        super(ForeignKeyField, self).__init__(*args, **kwargs)
+
+        # Update custom field-specific keyword arguments.
+        if not self.self_referential:
+            if model:
+                self.rel_model = model
+                self.rel_field = model._meta.primary_key
+
         if field is not None:
             self.rel_field = field
-        else:
-            self.rel_field = model._meta.primary_key
-        super(ForeignKeyField, self).__init__(*args, **kwargs)
+
+        self.backref = backref
+        self.field_kwargs.update(
+            model=model,
+            field=field,
+            backref=backref)
 
     cpdef python_value(self, value):
         return self.rel_field.python_value(value)
@@ -2037,6 +2326,21 @@ cdef class ForeignKeyField(Field):
             self.column_name = name + '_id'
 
         self.backref = self.backref or '%s_set' % (model.__name__.lower())
+
+        # Determine rel_model for self-referential foreign keys.
+        if self.self_referential:
+            self.rel_model = model
+
+        # Determine rel_field if unspecified or provided as a string.
+        if isinstance(self.rel_field, basestring):
+            self.rel_field = getattr(self.rel_model, self.rel_field)
+        elif not self.rel_field:
+            self.rel_field = self.rel_model._meta.primary_key
+
+        # Update the field_kwargs to allow field to be cloned.
+        self.field_kwargs.update(
+            model=self.rel_model,
+            field=self.rel_field)
 
         super(ForeignKeyField, self).bind(model, name)
 
@@ -2077,6 +2381,9 @@ cdef class RelatedFieldDescriptor(FieldDescriptor):
         return self.field
 
     def __set__(self, instance, value):
+        if isinstance(value, dict):
+            value = self.rel_model(**value)
+
         if isinstance(value, self.rel_model):
             instance._data[self.att_name] = getattr(
                 value, self.rel_field.name)
@@ -2109,8 +2416,8 @@ cdef class ObjectIdDescriptor(object):
 cdef class BackrefDescriptor(object):
     cdef:
         basestring att_name
-        Field field
-        object rel_model
+        readonly Field field
+        readonly object rel_model
 
     def __init__(self, field, name):
         self.field = field
@@ -2132,7 +2439,7 @@ cdef class ModelCursorWrapper(DictCursorWrapper):
     database into their Python equivalents.
     """
     cdef:
-        dict converters
+        dict converters, fields
         list select
         object model
 
@@ -2141,44 +2448,39 @@ cdef class ModelCursorWrapper(DictCursorWrapper):
         self.model = model
         self.select = select
 
-    cdef _initialize_columns(self):
+    cdef _initialize_converters(self):
         cdef:
             basestring column
+            Field field
             int idx
-            Node node
-            tuple column_tuple
-            tuple description = self.cursor.getdescription()
+            object node
 
-        self.ncols = len(description)
-        self.columns = []
         self.converters = {}
+        self.fields = {}
         for idx in range(self.ncols):
+            column = self.columns[idx]
             node = self.select[idx]
-            column = description[idx][0][description[idx][0].find('.') + 1:]
 
             if isinstance(node, Field):
-                self.converters[idx] = node.python_value
-            elif column in self.model._meta.combined:
-                self.converters[idx] = (
-                    self.model._meta.combined[column].python_value)
-
-            self.columns.append(column)
+                self.converters[column] = node.python_value
+                self.fields[idx] = node
+            else:
+                field = self.model._meta.combined.get(column)
+                if field is not None:
+                    self.converters[column] = field.python_value
 
     cdef initialize(self):
         self._initialize_columns()
+        self._initialize_converters()
 
     cdef process_row(self, tuple row):
         cdef:
             basestring col_name
-            dict result = {}
-            int i = 0
+            dict result
 
-        for i in range(self.ncols):
-            col_name = self.columns[i]
-            if i in self.converters:
-                result[col_name] = self.converters[i](row[i])
-            else:
-                result[col_name] = row[i]
+        result = self._row_to_dict(row)
+        for col_name in self.converters:
+            result[col_name] = self.converters[col_name](result[col_name])
 
         return self.model(**result)
 
@@ -2186,80 +2488,124 @@ cdef class ModelCursorWrapper(DictCursorWrapper):
 cdef class JoinedModelCursorWrapper(ModelCursorWrapper):
     cdef:
         dict joins
-        list column_to_model
         list from_
-        list join_list
-        set selected_models
+        list column_metadata, join_list
 
     def __init__(self, cursor, model, list select, list from_, dict joins):
         super(JoinedModelCursorWrapper, self).__init__(cursor, model, select)
         self.joins = joins
         self.from_ = from_
 
+    cdef dict get_models_in_query(self):
+        cdef:
+            dict models
+            list stack
+            set seen
+            tuple join
+
+        models = {}
+        seen = set()
+        stack = [self.model] + self.from_
+        while stack:
+            curr = stack.pop()
+            if curr in seen:
+                continue
+            seen.add(curr)
+            if isclass(curr) and issubclass(curr, Model):
+                models[curr._meta.table_name] = curr
+            if curr in self.joins:
+                for join in self.joins[curr]:
+                    stack.append(join[0])
+        return models
+
     cdef initialize(self):
         cdef:
-            basestring attr
+            basestring attr, column, join_type
+            bint is_model
+            dict models
+            Expression expr
+            list stack
             int idx
-            list join_list, stack
-            Node node
-            set seen = set()
+            set seen
 
         self._initialize_columns()
+        self._initialize_converters()
 
-        # Determine which models have been selected.
-        self.column_to_model = []
-        self.selected_models = set([self.model])
+        self.column_metadata = []
+        models = self.get_models_in_query()
 
         for idx in range(self.ncols):
             node = self.select[idx]
-            if isinstance(node, Field):
-                key = node.model
-            else:
-                key = self.model
-            self.selected_models.add(key)
-            self.column_to_model.append(key)
+            column = self.columns[idx]
+
+            key = constructor = self.model
+            if idx in self.fields:
+                node = self.fields[idx]
+                key = constructor = node.model
+            elif isinstance(node, _BaseEntity):
+                key = (<Entity>node).table()
+                constructor = dict
+
+            self.column_metadata.append((key, constructor))
 
         self.join_list = []
+        seen = set()
         stack = [self.model] + self.from_
         while stack:
             current = stack.pop()
-            if current not in self.joins or current in seen:
+            if current in seen or current not in self.joins:
                 continue
             seen.add(current)
-            for join in self.joins[current]:
-                # Join is a 3-tuple of dest, expr, type.
-                if join[0] in self.selected_models or \
-                   current in self.selected_models:
-                    self.join_list.append((current,) + join)
-                    stack.append(join[0])
+            for (dest, expr, join_type) in self.joins[current]:
+                stack.append(dest)
+                is_model = isclass(dest) and issubclass(dest, Model)
+                if not is_model and isinstance(dest, Table):
+                    dest = (<Table>dest).table()
 
-    cdef process_row(self, tuple row):
-        # Follow join graph.
+                attr = expr._alias
+                if not attr:
+                    if is_model:
+                        attr = dest._meta.name
+                    elif isinstance(dest, _BaseEntity):
+                        attr = (<Entity>dest).path[0]
+
+                if attr:
+                    self.join_list.append((current, dest, attr, is_model))
+
+    cdef Model process_row(self, tuple row):
         cdef:
-            basestring join_type
-            dict models = {}
-            Expression expr
+            basestring attr, column
+            bint is_model
+            dict data = {}
+            list prepared
             int idx
-            list instances = []
 
         for idx in range(self.ncols):
-            constructor = self.column_to_model[idx]
-            if constructor not in models:
-                models[constructor] = constructor()
-            instance = models[constructor]
-            if idx in self.converters:
-                setattr(
-                    instance,
-                    self.columns[idx],
-                    self.converters[idx](row[idx]))
-            else:
-                setattr(instance, self.columns[idx], row[idx])
+            key, constructor = self.column_metadata[idx]
 
-        prepared = [models[self.model]]
-        for (src, dest, expr, join_type) in self.join_list:
-            instance = models[src]
-            joined_instance = models[dest]
-            setattr(instance, expr._alias or expr.rhs.name, joined_instance)
+            if key not in data:
+                data[key] = constructor()
+            instance = data[key]
+
+            column = self.columns[idx]
+            value = row[idx]
+            if column in self.converters:
+                value = self.converters[column](value)
+
+            if isinstance(instance, dict):
+                instance[column] = value
+            else:
+                setattr(instance, column, value)
+
+        prepared = [data[self.model]]
+        for (src, dest, attr, is_model) in self.join_list:
+            instance = data[src]
+            try:
+                joined_instance = data[dest]
+            except KeyError:
+                continue
+
+            setattr(instance, attr, joined_instance)
             prepared.append(joined_instance)
 
         return prepared[0]
@@ -2290,18 +2636,21 @@ class DoesNotExist(Exception): pass
 
 cdef class Metadata(object):
     cdef:
-        readonly basestring name, table_name
+        readonly basestring name, table_name, extension
         readonly dict backrefs, refs
         readonly dict columns, fields, combined
         readonly dict defaults, defaults_callables
+        readonly dict options
         readonly Field primary_key
         readonly list sorted_fields
         readonly object database
         readonly Table table
 
-    def __init__(self, database, table_name, field_list):
+    def __init__(self, database, table_name, field_list, extension, options):
         self.database = database
         self.name = self.table_name = table_name
+        self.extension = extension
+        self.options = options
 
         self.backrefs = {}
         self.refs = {}
@@ -2347,6 +2696,13 @@ cdef class Metadata(object):
             self.fields.values(),
             key=operator.attrgetter('sort_key'))
 
+    def remove_field(self, name):
+        field = self.fields[name]
+        del self.fields[name]
+        del self.columns[name]
+        del self.combined[name]
+        self.sorted_fields.remove(field)
+
 
 cdef class ModelSchemaManager(object):
     cdef:
@@ -2355,14 +2711,23 @@ cdef class ModelSchemaManager(object):
     def __init__(self, model):
         self.model = model
 
-    cdef Clause create_table(self, bint safe):
+    cpdef Clause create_table(self, bint safe, dict options):
         cdef:
+            basestring key
             list columns = [], constraints = [], parts = []
             Field field, rel_field
 
+        if issubclass(self.model, VirtualModel):
+            text = 'CREATE VIRTUAL TABLE'
+        else:
+            text = 'CREATE TABLE'
         parts.append(SQL(
-            'CREATE TABLE IF NOT EXISTS' if safe else 'CREATE TABLE'))
+            ('%s IF NOT EXISTS' if safe else '%s') % text))
         parts.append(self.model._meta.table)
+
+        if issubclass(self.model, VirtualModel):
+            parts.append(SQL('USING %s' % self.model._meta.extension))
+
         for field in self.model._meta.sorted_fields:
             columns.append(field.ddl())
             if isinstance(field, ForeignKeyField):
@@ -2374,6 +2739,21 @@ cdef class ModelSchemaManager(object):
                     field.rel_model._meta.table,
                     EnclosedClause((rel_field.as_entity(),)),
                 )))
+
+        table_options = getattr(self.model._meta, 'options', None) or {}
+        if options:
+            table_options.update(options)
+
+        if table_options:
+            for key, value in sorted(table_options.items()):
+                if isinstance(value, Field):
+                    value = (<Field>value).as_entity(with_table=True)
+                elif isclass(value) and issubclass(value, Model):
+                    value = Entity([value._meta.table_name])
+                else:
+                    value = SQL(value)
+
+                constraints.append(Clause((SQL(key), value), glue='='))
 
         parts.append(EnclosedClause(columns + constraints))
         return Clause(parts)
@@ -2442,9 +2822,9 @@ cdef class ModelSchemaManager(object):
 
         return indexes
 
-    cdef create_all(self, safe=True):
+    cdef create_all(self, safe=True, options=None):
         db = self.model._meta.database
-        create_table_clause = self.create_table(safe)
+        create_table_clause = self.create_table(safe, options)
         db.execute(create_table_clause)
 
         for clause in self.create_indexes(safe):
@@ -2456,7 +2836,7 @@ cdef class ModelSchemaManager(object):
         db.execute(drop_table_clause)
 
         for clause in self.drop_indexes(safe):
-            db.execute(clause, safe)
+            db.execute(clause)
 
 
 cdef class Model(Node):
@@ -2490,8 +2870,8 @@ cdef class Model(Node):
         return data
 
     @classmethod
-    def create_table(cls, safe=True):
-        ModelSchemaManager(cls).create_all(safe)
+    def create_table(cls, safe=True, options=None):
+        ModelSchemaManager(cls).create_all(safe, options)
 
     @classmethod
     def drop_table(cls, safe=True):
@@ -2499,8 +2879,15 @@ cdef class Model(Node):
 
     cpdef save(self, force_insert=False):
         cdef:
-            basestring primary_key = self._meta.primary_key.name
+            basestring primary_key
             dict data = self._data.copy()
+            Field primary_key_field = self._meta.primary_key
+
+        if primary_key_field:
+            primary_key = primary_key_field.name
+        else:
+            # Short-circuit to INSERT if no primary key is set.
+            return self.insert(data).execute()
 
         if data.get(primary_key):
             pk = data.pop(primary_key)
@@ -2602,7 +2989,7 @@ cdef class Model(Node):
 
 cdef class FieldDescriptor(object):
     cdef:
-        Field field
+        readonly Field field
         basestring att_name
 
     def __init__(self, field, name):
@@ -2618,7 +3005,124 @@ cdef class FieldDescriptor(object):
         instance._data[self.att_name] = value
 
 
-cpdef create_model(database, basestring table_name, field_list):
+cdef class VirtualModel(Model):
+    pass
+
+
+cdef class VirtualField(Field):
+    cpdef bind(self, model, basestring name):
+        super(VirtualField, self).bind(model, name)
+        model._meta.remove_field(name)
+
+
+cdef class RowIDField(PrimaryKeyField):
+    cpdef bind(self, model, basestring name):
+        if name != 'rowid':
+            raise ValueError('RowIDField must be named "rowid".')
+        super(RowIDField, self).bind(model, name)
+        model._meta.remove_field(name)
+
+
+cdef class FTSModel(VirtualModel):
+    @classmethod
+    def _fts_cmd(cls, cmd):
+        tbl = cls._meta.table_name
+        res = cls._meta.database.execute_sql(
+            "INSERT INTO %s(%s) VALUES('%s');" % (tbl, tbl, cmd))
+        return res.fetchone()
+
+    @classmethod
+    def optimize(cls):
+        return cls._fts_cmd('optimize')
+
+    @classmethod
+    def rebuild(cls):
+        return cls._fts_cmd('rebuild')
+
+    @classmethod
+    def integrity_check(cls):
+        return cls._fts_cmd('integrity-check')
+
+    @classmethod
+    def merge(cls, blocks=200, segments=8):
+        return cls._fts_cmd('merge=%s,%s' % (blocks, segments))
+
+    @classmethod
+    def automerge(cls, state=True):
+        return cls._fts_cmd('automerge=%s' % (state and '1' or '0'))
+
+    @classmethod
+    def match(cls, term):
+        """
+        Generate a `MATCH` expression appropriate for searching this table.
+        """
+        return cls._meta.table.match(term)
+
+    @classmethod
+    def rank(cls):
+        return fn.rank(fn.matchinfo(cls._meta.table))
+
+    @classmethod
+    def bm25(cls, field, k=1.2, b=0.75):
+        if isinstance(field, basestring):
+            field = getattr(cls, field)
+        field_idx = cls._meta.sorted_fields.index(field)
+        match_info = fn.matchinfo(cls._meta.table, 'pcxnal')
+        return fn.bm25(match_info, field_idx, k, b)
+
+    @classmethod
+    def search(cls, term, alias='score'):
+        """Full-text search using selected `term`."""
+        return (cls
+                .select(cls, cls.rank().alias(alias))
+                .where(cls.match(term))
+                .order_by(SQL(alias).desc()))
+
+    @classmethod
+    def search_bm25(cls, term, field, k=1.2, b=0.75, alias='score'):
+        """Full-text search for selected `term` using BM25 algorithm."""
+        return (cls
+                .select(cls, cls.bm25(field, k, b).alias(alias))
+                .where(cls.match(term))
+                .order_by(SQL(alias).desc()))
+
+
+cpdef create_model(database, basestring table_name, field_list,
+                   bint include_primary_key=True, bint virtual=False,
+                   basestring extension='', dict options=None,
+                   base_class=None, class_name=None):
+    """
+    This function will create a `Model` subclass for the specified table,
+    with the specified fields. There are a handful of additional parameters
+    that can be used for working with Virtual Tables.
+
+    :param Database database: A database instance.
+    :param str table_name: The name of the table.
+    :param list field_list: A list of 2-tuples consisting of field name and
+        Field instance.
+    :param bool include_primary_key: Boolean value indicating whether a
+        Primary Key should automatically be created if one is not specifiedl
+        By default Swee'pea will create a primary key column.
+    :param bool virtual: Use this to indicate a virtual table.
+    :param str extension: Extension associated with this virtual table.
+    :param dict options: Optional configuration values for the virtual table,
+        for instance with FTS3, you might specify ``{'tokenize': 'porter'}``.
+    :param base_class: Base model class to extend.
+    :param class_name: Name to use for class. If not supplied, derived from
+        the table name.
+
+    Example:
+
+    .. code-block:: python
+
+        db = Database('app.db')
+
+        User = create_model(db, 'users', (
+            ('username', TextField(unique=True)),
+            ('timestamp', DateTimeField(default=datetime.datetime.now)),
+            ('password_hash', BlobField()),
+        ))
+    """
     cdef:
         dict attrs = {}
         basestring column_name, field_name
@@ -2626,20 +3130,249 @@ cpdef create_model(database, basestring table_name, field_list):
         Field primary_key = None
         Metadata metadata
         object ModelClass
+        tuple bases
 
     for field_name, field_obj in field_list:
         if field_obj.primary_key:
             primary_key = field_obj
 
-    if primary_key is None:
+    if primary_key is None and include_primary_key:
         primary_key = PrimaryKeyField()
         field_list = (('id', primary_key),) + field_list
 
-    attrs['_meta'] = Metadata(database, table_name, field_list)
+    attrs['_meta'] = Metadata(
+        database,
+        table_name,
+        field_list,
+        extension,
+        options)
 
-    ModelClass = type('%sModel' % table_name.title(), (Model,), attrs)
+    if base_class:
+        bases = (base_class,)
+    elif virtual:
+        bases = (VirtualModel,)
+    else:
+        bases = (Model,)
+
+    attrs['__final__'] = True
+    class_name = class_name or '%sModel' % table_name.title()
+    ModelClass = type(class_name, bases, attrs)
 
     for field_name, field_obj in field_list:
         field_obj.bind(ModelClass, field_name)
 
     return ModelClass
+
+
+cpdef create_fts_model(database, basestring table_name, field_list,
+                       basestring fts_ver='fts4', dict options=None):
+    """
+    Wrapper around :py:func:`create_model()` to create models suitable
+    for using with the full-text search extension.
+    """
+    cdef dict all_options = {'tokenize': 'porter'}
+    if options:
+        all_options.update(options)
+
+    return create_model(database, table_name, field_list, False, True,
+                        fts_ver, all_options, FTSModel)
+
+
+cdef list _parse_match_info(object buf):
+    # See http://sqlite.org/fts3.html#matchinfo
+    cdef:
+        int bufsize = len(buf), i
+
+    bufsize = len(buf)  # Length in bytes.
+    return [struct.unpack('@I', buf[i:i+4])[0] for i in range(0, bufsize, 4)]
+
+
+cdef float rank(object raw_match_info):
+    # Ranking implementation, which parse matchinfo.
+    cdef:
+        float score = 0.0
+        int p, c, phrase_num, col_num, col_idx, x1, x2
+        list match_info
+    # Handle match_info called w/default args 'pcx' - based on the example rank
+    # function http://sqlite.org/fts3.html#appendix_a
+    match_info = _parse_match_info(raw_match_info)
+    p, c = match_info[:2]
+    for phrase_num in range(p):
+        phrase_info_idx = 2 + (phrase_num * c * 3)
+        for col_num in range(c):
+            col_idx = phrase_info_idx + (col_num * 3)
+            x1, x2 = match_info[col_idx:col_idx + 2]
+            if x1 > 0:
+                score += float(x1) / x2
+    return score
+
+
+cdef float bm25(object raw_match_info, int column_index, float k1, float b):
+    """
+    Okapi BM25 ranking implementation (FTS4 only).
+
+    * Format string *must* be pcxnal
+    * Second parameter to bm25 specifies the index of the column, on
+      the table being queries.
+    """
+    cdef:
+        float avg_length, doc_length, D, term_freq, term_matches, idf
+        float denom, rhs, score
+        int p, c, n_idx, a_idx, l_idx, n
+        int total_docs, x_idx
+        list match_info, a, l
+
+    k1 = k1 or 1.2
+    b = b or 0.75
+    match_info = _parse_match_info(raw_match_info)
+    score = 0.0
+    # p, 1 --> num terms
+    # c, 1 --> num cols
+    # x, (3 * p * c) --> for each phrase/column,
+    #     term_freq for this column
+    #     term_freq for all columns
+    #     total documents containing this term
+    # n, 1 --> total rows in table
+    # a, c --> for each column, avg number of tokens in this column
+    # l, c --> for each column, length of value for this column (in this row)
+    # s, c --> ignore
+    p, c = match_info[:2]
+    n_idx = 2 + (3 * p * c)
+    a_idx = n_idx + 1
+    l_idx = a_idx + c
+    n = match_info[n_idx]
+    a = match_info[a_idx: a_idx + c]
+    l = match_info[l_idx: l_idx + c]
+
+    total_docs = n
+    avg_length = float(a[column_index])
+    doc_length = float(l[column_index])
+    if avg_length == 0:
+        D = 0
+    else:
+        D = 1 - b + (b * (doc_length / avg_length))
+
+    for phrase in range(p):
+        # p, c, p0c01, p0c02, p0c03, p0c11, p0c12, p0c13, p1c01, p1c02, p1c03..
+        # So if we're interested in column <i>, the counts will be at indexes
+        x_idx = 2 + (3 * column_index * (phrase + 1))
+        term_freq = float(match_info[x_idx])
+        term_matches = float(match_info[x_idx + 2])
+
+        # The `max` check here is based on a suggestion in the Wikipedia
+        # article. For terms that are common to a majority of documents, the
+        # idf function can return negative values. Applying the max() here
+        # weeds out those values.
+        idf = max(
+            math.log(
+                (total_docs - term_matches + 0.5) /
+                (term_matches + 0.5)),
+            0)
+
+        denom = term_freq + (k1 * D)
+        if denom == 0:
+            rhs = 0
+        else:
+            rhs = (term_freq * (k1 + 1)) / denom
+
+        score += (idf * rhs)
+
+    return score
+
+
+class DeclarativeBase(type):
+    def __new__(cls, name, bases, attrs):
+        # Short circuit if this is the base Declarative class or if this class
+        # is constructed via `create_model()`.
+        if name == 'Declarative' or '__final__' in attrs:
+            return super(DeclarativeBase, cls).__new__(cls, name, bases, attrs)
+
+        fields = {}
+        database = None
+        extension = None
+        options = None
+        table_name = None
+
+        for base in bases:
+            # Copy fields and field-descriptors.
+            for key, value in base.__dict__.iteritems():
+                tmp_field = None
+                if isinstance(value, FieldDescriptor):
+                    tmp_field = value.field
+                elif isinstance(value, Field):
+                    tmp_field = value
+
+                if tmp_field and not isinstance(tmp_field, PrimaryKeyField):
+                    fields[key] = copy(tmp_field)
+
+            # Attempt to inherit metadata options.
+            if not hasattr(base, '_meta'):
+                continue
+            else:
+                base_meta = base._meta
+
+            database = database or base_meta.database
+            extension = base_meta.extension if extension is None else extension
+            options = base_meta.options if options is None else options
+
+        # Load fields from the new class definition.
+        for key, value in attrs.items():
+            if isinstance(value, Field):
+                fields[key] = value
+
+        # Load class Meta options.
+        Meta = attrs.pop('Meta', None)
+        primary_key = True
+        if Meta:
+            ga = lambda attr: getattr(Meta, attr, None)
+            if ga('database'):
+                database = Meta.database
+            if ga('extension'):
+                extension = Meta.extension
+            if ga('options'):
+                options = Meta.options
+            if ga('primary_key') is not None:
+                primary_key = Meta.primary_key
+            if ga('table_name'):
+                table_name = Meta.table_name
+
+        # Create the actual class, allowing Python to build the object
+        # and inherit attributes, methods, etc.
+        Model = super(DeclarativeBase, cls).__new__(
+            cls,
+            name,
+            bases,
+            attrs)
+
+        # Prep values for passing in to `create_model()`.
+        sorted_fields = sorted(fields.items(), key=lambda f: f[1].field_order)
+        table_name = table_name or re.sub('[^\w]+', '_', name.lower())
+
+        # Create a model using our new class as the base class. To prevent
+        # recursion, `create_model()`, which uses our declarative model as the
+        # base class, will add a special `__final__` attr to the dict. This
+        # instructs the DeclarativeBase metaclass to stop processing.
+        return create_model(
+            database,
+            table_name,
+            tuple(sorted_fields),
+            include_primary_key=primary_key,
+            virtual=bool(extension),
+            extension=extension or '',
+            options=options,
+            base_class=Model,
+            class_name=name,
+        )
+
+
+class Declarative(Model):
+    __metaclass__ = DeclarativeBase
+
+
+cdef tuple _model_sort_key(model):
+    return (model._meta.name, model._meta.table_name)
+
+
+# TODO:
+# * unindexed, e.g. col_name UNINDEXED
+# * backrefs?
