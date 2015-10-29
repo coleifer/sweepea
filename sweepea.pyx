@@ -845,9 +845,6 @@ cdef class _BaseEntity(Node):
             return Entity((self._alias, name))
         return Entity(self.path + (name,))
 
-    cdef Table table(self):
-        return Table(self.path[:1]) if len(self.path) > 1 else None
-
     cdef Entity tail(self):
         return Entity((self.path[-1],))
 
@@ -859,15 +856,14 @@ cdef class Entity(_BaseEntity):
     def __getattr__(self, name):
         raise AttributeError(name)
 
+    cdef Table table(self):
+        if len(self.path) > 1:
+            return Table((self.path[0],))
+
 
 cdef class Table(_BaseEntity):
     def __repr__(self):
         return '<Table: %s>' % self.str_path
-
-    cdef Table table(self):
-        if self._alias:
-            return Table((self._alias,))
-        return self
 
 
 cdef class SQL(Node):
@@ -1250,6 +1246,7 @@ cdef class ObjectCursorWrapper(DictCursorWrapper):
 
     def __init__(self, cursor, constructor):
         super(ObjectCursorWrapper, self).__init__(cursor)
+        self.constructor = constructor
 
     cdef process_row(self, tuple row):
         cdef dict row_dict = self._row_to_dict(row)
@@ -1604,6 +1601,7 @@ cdef class SelectQuery(Query):
         public int _limit, _offset
         public list _select, _from, _group_by, _order_by
         public Node _having
+        public object _constructor
 
     def __init__(self, database, model=None):
         super(SelectQuery, self).__init__(database, model)
@@ -1619,6 +1617,7 @@ cdef class SelectQuery(Query):
         self._dicts = False
         self._namedtuples = False
         self._tuples = False
+        self._constructor = None
         self.cursor_wrapper = None
         if model is not None:
             self._from = [model._meta.table]
@@ -1642,6 +1641,7 @@ cdef class SelectQuery(Query):
         query._dicts = self._dicts
         query._namedtuples = self._namedtuples
         query._tuples = self._tuples
+        query._constructor = self._constructor
         return query
 
     @returns_clone
@@ -1742,6 +1742,10 @@ cdef class SelectQuery(Query):
     def tuples(self, tuples=True):
         self._tuples = tuples
 
+    @returns_clone
+    def constructor(self, constructor):
+        self._constructor = constructor
+
     cpdef _aggregate(self, Node aggregation=None):
         if aggregation is None:
             aggregation = fn.Count(SQL('*'))
@@ -1829,6 +1833,8 @@ cdef class SelectQuery(Query):
                 return CursorWrapper(self._execute())
             elif self._namedtuples:
                 return NamedTupleCursorWrapper(self._execute())
+            elif self._constructor:
+                return ObjectCursorWrapper(self._execute(), self._constructor)
             return self.get_default_cursor_wrapper()
 
     def __iter__(self):
@@ -2496,57 +2502,39 @@ cdef class JoinedModelCursorWrapper(ModelCursorWrapper):
         self.joins = joins
         self.from_ = from_
 
-    cdef dict get_models_in_query(self):
-        cdef:
-            dict models
-            list stack
-            set seen
-            tuple join
-
-        models = {}
-        seen = set()
-        stack = [self.model] + self.from_
-        while stack:
-            curr = stack.pop()
-            if curr in seen:
-                continue
-            seen.add(curr)
-            if isclass(curr) and issubclass(curr, Model):
-                models[curr._meta.table_name] = curr
-            if curr in self.joins:
-                for join in self.joins[curr]:
-                    stack.append(join[0])
-        return models
-
     cdef initialize(self):
         cdef:
-            basestring attr, column, join_type
-            bint is_model
-            dict models
+            basestring attr, column
+            bint is_dict, is_model
             Expression expr
             list stack
             int idx
             set seen
+            tuple join
 
         self._initialize_columns()
         self._initialize_converters()
 
         self.column_metadata = []
-        models = self.get_models_in_query()
 
         for idx in range(self.ncols):
             node = self.select[idx]
             column = self.columns[idx]
 
+            is_dict = False
             key = constructor = self.model
             if idx in self.fields:
                 node = self.fields[idx]
                 key = constructor = node.model
-            elif isinstance(node, _BaseEntity):
+            elif isinstance(node, Entity):
                 key = (<Entity>node).table()
-                constructor = dict
+                if key is not None:
+                    constructor = dict
+                    is_dict = True
+                else:
+                    key = self.model
 
-            self.column_metadata.append((key, constructor))
+            self.column_metadata.append((key, constructor, is_dict))
 
         self.join_list = []
         seen = set()
@@ -2556,32 +2544,43 @@ cdef class JoinedModelCursorWrapper(ModelCursorWrapper):
             if current in seen or current not in self.joins:
                 continue
             seen.add(current)
-            for (dest, expr, join_type) in self.joins[current]:
+            for join in self.joins[current]:
+                dest = join[0]
+                expr = join[1]
                 stack.append(dest)
-                is_model = isclass(dest) and issubclass(dest, Model)
-                if not is_model and isinstance(dest, Table):
-                    dest = (<Table>dest).table()
 
-                attr = expr._alias
-                if not attr:
-                    if is_model:
-                        attr = dest._meta.name
-                    elif isinstance(dest, _BaseEntity):
-                        attr = (<Entity>dest).path[0]
+                is_model = False
+                if isclass(dest) and issubclass(dest, Model):
+                    is_model = True
+                elif isinstance(dest, Table) and dest._alias:
+                    # When an Entity is accessed from an aliased table, the
+                    # entity's path contains the alias. Therefore, if we
+                    # have a table with an alias, we want the destination to
+                    # reflect the same alias as the entities.
+                    dest = Table((dest._alias,))
+
+                if expr._alias:
+                    attr = expr._alias
+                elif is_model:
+                    attr = dest._meta.name
+                elif isinstance(dest, _BaseEntity):
+                    attr = (<Entity>dest).path[0]
+                else:
+                    attr = ''
 
                 if attr:
-                    self.join_list.append((current, dest, attr, is_model))
+                    self.join_list.append((current, dest, attr))
 
     cdef Model process_row(self, tuple row):
         cdef:
             basestring attr, column
-            bint is_model
+            bint is_dict
             dict data = {}
             list prepared
             int idx
 
         for idx in range(self.ncols):
-            key, constructor = self.column_metadata[idx]
+            key, constructor, is_dict = self.column_metadata[idx]
 
             if key not in data:
                 data[key] = constructor()
@@ -2592,13 +2591,13 @@ cdef class JoinedModelCursorWrapper(ModelCursorWrapper):
             if column in self.converters:
                 value = self.converters[column](value)
 
-            if isinstance(instance, dict):
+            if is_dict:
                 instance[column] = value
             else:
                 setattr(instance, column, value)
 
         prepared = [data[self.model]]
-        for (src, dest, attr, is_model) in self.join_list:
+        for (src, dest, attr) in self.join_list:
             instance = data[src]
             try:
                 joined_instance = data[dest]
@@ -2629,6 +2628,10 @@ cdef class ModelSelectQuery(SelectQuery):
                 self._execute(),
                 self.model,
                 self._select)
+
+    cpdef flat(self, is_flat=True):
+        func = self.model if is_flat else None
+        return self.constructor(func)
 
 
 class DoesNotExist(Exception): pass
@@ -2713,7 +2716,8 @@ cdef class ModelSchemaManager(object):
 
     cpdef Clause create_table(self, bint safe, dict options):
         cdef:
-            basestring key
+            basestring key, text
+            dict table_options
             list columns = [], constraints = [], parts = []
             Field field, rel_field
 
@@ -2721,6 +2725,7 @@ cdef class ModelSchemaManager(object):
             text = 'CREATE VIRTUAL TABLE'
         else:
             text = 'CREATE TABLE'
+
         parts.append(SQL(
             ('%s IF NOT EXISTS' if safe else '%s') % text))
         parts.append(self.model._meta.table)
@@ -2860,12 +2865,13 @@ cdef class Model(Node):
         cdef:
             basestring name
             dict data = {}
-            Metadata meta = self._meta
+            dict defaults = self._meta.defaults
+            dict defaults_callables = self._meta.defaults_callables
 
-        for name in meta.defaults:
-            data[name] = meta.defaults[name]
-        for name in meta.defaults_callables:
-            data[name] = meta.defaults_callables[name]()
+        for name in defaults:
+            data[name] = defaults[name]
+        for name in defaults_callables:
+            data[name] = defaults_callables[name]()
 
         return data
 
@@ -2971,6 +2977,10 @@ cdef class Model(Node):
     @classmethod
     def get(cls, *expressions):
         return cls.select().where(*expressions).get()
+
+    @classmethod
+    def alias(cls, name):
+        return cls._meta.table.alias(name)
 
     cdef _get_pk_value(self):
         return getattr(self, self._meta.primary_key.name, None)
@@ -3371,8 +3381,3 @@ class Declarative(Model):
 
 cdef tuple _model_sort_key(model):
     return (model._meta.name, model._meta.table_name)
-
-
-# TODO:
-# * unindexed, e.g. col_name UNINDEXED
-# * backrefs?
