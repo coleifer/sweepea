@@ -1,0 +1,4 @@
+sqlite_ext.c
+sqlite_ext.so
+MANIFEST
+build/*

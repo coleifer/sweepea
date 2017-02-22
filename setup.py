@@ -1,3 +1,4 @@
+import glob
 import os
 
 from distutils.core import setup, Extension
@@ -5,28 +6,21 @@ try:
     from Cython.Build import cythonize
 except ImportError:
     import warnings
-    cython_installed = False
-    warnings.warn('Cython not installed, using pre-generated C source file.')
-else:
-    cython_installed = True
+    raise RuntimeError('Cython must be installed to build sweepea.')
 
-
-if cython_installed:
-    python_source = 'sweepea.pyx'
-else:
-    python_source = 'sweepea.c'
-    cythonize = lambda obj: [obj]
-
-library_source = None
-
+python_source = 'sweepea.pyx'
 extension = Extension(
     'sweepea',
+    define_macros=[('MODULE_NAME', '"sweepea"')],
+    libraries=['sqlite3'],
     sources=[python_source])
 
 setup(
     name='sweepea',
-    version='0.1.0',
-    description='Fast Python bindings for SQLite3',
+    version='0.2.0',
+    description='',
+    url='https://github.com/coleifer/sweepea',
+    install_requires=['Cython'],
     author='Charles Leifer',
     author_email='',
     ext_modules=cythonize(extension),
