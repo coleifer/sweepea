@@ -815,6 +815,33 @@ class TestQueryExecution(BaseTestCase):
             ('huey', 'purr'),
             ('mickey', 'woof')])
 
+    def test_cursor_wrappers(self):
+        Person.insert((
+            {Person.name: 'charlie'},
+            {Person.name: 'huey'},
+            {Person.name: 'mickey'},
+            {Person.name: 'zaizee'})).execute(database)
+        query = (Person
+                 .select(
+                     Person.name,
+                     fn.SUBSTR(fn.MD5(Person.name), 1, 6).alias('hash'))
+                 .order_by(Person.name))
+
+        dicts = list(query.dicts().execute(database))
+        self.assertEqual(dicts, [
+            {'hash': 'bf779e', 'name': 'charlie'},
+            {'hash': 'ef6307', 'name': 'huey'},
+            {'hash': '4d5257', 'name': 'mickey'},
+            {'hash': '7670f7', 'name': 'zaizee'},
+        ])
+
+        objs = list(query.objects().execute(database))
+        self.assertEqual([(obj.hash, obj.name) for obj in objs], [
+            ('bf779e', 'charlie'),
+            ('ef6307', 'huey'),
+            ('4d5257', 'mickey'),
+            ('7670f7', 'zaizee')])
+
     def test_builtin_functions(self):
         Person.insert((
             {Person.name: 'charlie'},
@@ -834,6 +861,7 @@ class TestQueryExecution(BaseTestCase):
                 .select(Person.name)
                 .where(fn.REGEXP(Person.name, '^.+ey$'))
                 .order_by(Person.name)
+                .dicts()
                 .execute(database))
         self.assertEqual([row['name'] for row in curs],
                          ['huey', 'mickey'])

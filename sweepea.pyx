@@ -815,6 +815,141 @@ cdef int _aggressive_busy_handler(void *ptr, int n):
     return 0
 
 
+cdef class CursorWrapper(object)  # Forward declaration.
+
+
+cdef class ResultIterator(object):
+    cdef:
+        bint is_populated
+        int index
+        CursorWrapper cursor_wrapper
+
+    def __init__(self, CursorWrapper cursor_wrapper):
+        self.cursor_wrapper = cursor_wrapper
+        self.index = 0
+
+    def __next__(self):
+        cdef CursorWrapper cw = self.cursor_wrapper
+        if self.index < cw.count:
+            obj = cw.result_cache[self.index]
+        elif not cw.is_populated:
+            obj = cw.iterate()
+            cw.result_cache.append(obj)
+            cw.count += 1
+        else:
+            raise StopIteration
+        self.index += 1
+        return obj
+
+
+cdef class CursorWrapper(object):
+    cdef:
+        bint is_initialized, is_populated
+        int count, index
+        list columns, result_cache
+        object cursor, transform
+
+    def __init__(self, cursor, transform=None):
+        self.cursor = cursor
+        self.transform = transform
+        self.is_initialized = False
+        self.is_populated = False
+        self.result_cache = []
+
+    def __iter__(self):
+        if self.is_populated:
+            return iter(self.result_cache)
+        return ResultIterator(self)
+
+    def __len__(self):
+        self.fill_cache()
+        return self.count
+
+    cdef initialize(self):
+        self.columns = [col[0] for col in self.cursor.description]
+        self.count = self.index = 0
+        self.is_initialized = True
+
+    cdef iterate(self):
+        cdef:
+            tuple row = self.cursor.fetchone()
+
+        if not row:
+            self.is_populated = True
+            raise StopIteration
+        elif not self.is_initialized:
+            self.initialize()
+
+        if self.transform is not None:
+            return self.transform(self, row)
+        else:
+            return row
+
+    def iterator(self):
+        while True:
+            yield self.iterate()
+
+    def __next__(self):
+        cdef object inst
+
+        if self.index < self.count:
+            inst = self.result_cache[self.index]
+            self.index += 1
+            return inst
+        elif self.is_populated:
+            raise StopIteration
+
+        inst = self.iterate()
+        self.result_cache.append(inst)
+        self.count += 1
+        self.index += 1
+        return inst
+
+    cpdef fill_cache(self, n=None):
+        cdef:
+            int counter = -1 if n is None else <int>n
+        if counter > 0:
+            counter = counter - self.count
+
+        self.index = self.count
+        while not self.is_populated and counter:
+            try:
+                next(self)
+            except StopIteration:
+                break
+            else:
+                counter -= 1
+
+
+cdef dict_transform(CursorWrapper cursor_wrapper, tuple row):
+    cdef:
+        basestring column
+        dict accum = {}
+        int i
+
+    for i, column in enumerate(cursor_wrapper.columns):
+        accum[column] = row[i]
+
+    return accum
+
+def DictCursorWrapper(cursor):
+    return CursorWrapper(cursor, dict_transform)
+
+cdef class NamedTupleCursorWrapper(CursorWrapper)  # Forward declaration.
+
+cdef namedtuple_transform(NamedTupleCursorWrapper cursor_wrapper, tuple row):
+    return cursor_wrapper.tuple_class(*row)
+
+cdef class NamedTupleCursorWrapper(CursorWrapper):
+    cdef:
+        object tuple_class
+
+    cdef initialize(self):
+        CursorWrapper.initialize(self)
+        self.tuple_class = namedtuple('Row', self.columns)
+        self.transform = namedtuple_transform
+
+
 cdef class _callable_context_manager(object):
     def __call__(self, fn):
         def inner(*args, **kwargs):
@@ -1135,7 +1270,6 @@ cdef class Database(object):
         Initialize the connection by setting per-connection-state, registering
         user-defined extensions, and configuring any hooks.
         """
-        conn.row_factory = pysqlite.Row  # Enable attribute access.
         conn.isolation_level = None  # Disable transaction state-machine.
 
         if self._pragmas:
@@ -2403,7 +2537,7 @@ class CompoundSelect(SelectBase):
         return self.apply_alias(ctx)
 
     def execute(self, database):
-        return database.execute(self)
+        return CursorWrapper(database.execute(self))
 
 
 class Select(SelectBase):
@@ -2422,6 +2556,8 @@ class Select(SelectBase):
         self._offset = offset
         self._distinct = distinct
         self._cursor = None
+        self._dicts = False
+        self._objects = False
 
     @Node.copy
     def select(self, *columns):
@@ -2458,6 +2594,14 @@ class Select(SelectBase):
     def distinct(self, is_distinct=True):
         self._distinct = is_distinct
 
+    @Node.copy
+    def dicts(self, as_dict=True):
+        self._dicts = as_dict
+
+    @Node.copy
+    def objects(self, as_object=True):
+        self._objects = as_object
+
     def __sql__(self, Context ctx):
         super(Select, self).__sql__(ctx)
         is_subquery = ctx.subquery
@@ -2485,7 +2629,13 @@ class Select(SelectBase):
         return self.apply_alias(ctx)
 
     def execute(self, Database database):
-        return database.execute(self)
+        cursor = database.execute(self)
+        if self._dicts:
+            return DictCursorWrapper(cursor)
+        elif self._objects:
+            return NamedTupleCursorWrapper(cursor)
+        else:
+            return CursorWrapper(cursor)
 
 
 class WriteQuery(Query):
