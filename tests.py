@@ -392,6 +392,58 @@ class TestHelpers(BaseTestCase):
 
         self.assertTrue(self._db.cache_used is not None)
 
+    def test_transactions(self):
+        def assertRegister(vals):
+            data = [row[0] for row in self.execute('SELECT data FROM register '
+                                                   'ORDER BY data ASC')]
+            self.assertEqual(data, vals)
+
+        def save(*vals):
+            for val in vals:
+                self.execute('INSERT INTO register (data) VALUES (?)', val)
+
+        self.assertTrue(self._db.autocommit)
+        self.execute('CREATE TABLE register (data TEXT)')
+
+        with self._db.atomic():
+            self.assertFalse(self._db.autocommit)
+            save('k1')
+
+        assertRegister(['k1'])
+
+        with self._db.atomic() as txn:
+            save('k2')
+            txn.rollback()
+            save('k3')
+            with self._db.atomic() as sp1:
+                save('k4')
+                with self._db.atomic() as sp2:
+                    save('k5')
+                    sp2.rollback()
+                with self._db.atomic() as sp3:
+                    save('k6')
+                    with self._db.atomic() as sp4:
+                        save('k7')
+                        with self._db.atomic() as sp5:
+                            save('k8')
+                        assertRegister(['k1', 'k3', 'k4', 'k6', 'k7', 'k8'])
+                        sp4.rollback()
+
+                    assertRegister(['k1', 'k3', 'k4', 'k6'])
+
+        assertRegister(['k1', 'k3', 'k4', 'k6'])
+        self.execute('DELETE FROM register')
+        assertRegister([])
+
+        with self._db.transaction() as txn:
+            save('k1')
+            with self._db.transaction() as txn2:
+                save('k2')
+                txn2.rollback()  # Actually issues a rollback.
+                assertRegister([])
+            save('k3')
+        assertRegister(['k3'])
+
 
 User = Table('users', ('id', 'username', 'is_admin'))
 Tweet = Table('tweet', ('id', 'user_id', 'content', 'timestamp'))

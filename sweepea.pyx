@@ -1022,12 +1022,13 @@ cdef class Database(object):
         dict _aggregates, _collations, _functions, _modules
         dict _function_map
         list _table_functions
-        object _local, _lock
+        object _lock
         object _commit_hook, _rollback_hook, _update_hook
         public dict connect_kwargs
         public list _pragmas
         public object database
         readonly bint deferred
+        readonly object _local
 
     def __init__(self, database, pragmas=None, journal_mode=None,
                  rank_functions=False, regex_function=True,
@@ -1379,7 +1380,7 @@ cdef class Database(object):
             self.connect()
         cursor = self._local.conn.cursor()
         cursor.execute(sql, params or ())
-        if commit:
+        if commit and len(self._local.transactions) == 0:
             self.commit()
         return cursor
 
@@ -1676,7 +1677,7 @@ cdef class _atomic(_callable_context_manager):
         Database db
         object _helper
 
-    def __init__(self, db):
+    def __init__(self, Database db):
         self.db = db
 
     def __enter__(self):
@@ -1696,7 +1697,7 @@ cdef class _transaction(_callable_context_manager):
         bint _orig
         Database db
 
-    def __init__(self, db, lock='DEFERRED'):
+    def __init__(self, Database db, lock='DEFERRED'):
         self.db = db
         self.lock = lock
 
@@ -1738,7 +1739,7 @@ cdef class _savepoint(_callable_context_manager):
         basestring sid, quoted_sid
         Database db
 
-    def __init__(self, db, sid=None):
+    def __init__(self, Database db, sid=None):
         self.db = db
         self.sid = sid or 's' + uuid.uuid4().hex
         self.quoted_sid = "%s" % self.sid
