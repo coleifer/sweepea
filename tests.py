@@ -874,9 +874,8 @@ class TestQueryExecution(BaseTestCase):
                 .select(Person.name)
                 .where(fn.REGEXP(Person.name, '^.+ey$'))
                 .order_by(Person.name)
-                .dicts()
                 .execute(database))
-        self.assertEqual([row['name'] for row in curs],
+        self.assertEqual([row.name for row in curs],
                          ['huey', 'mickey'])
 
 
