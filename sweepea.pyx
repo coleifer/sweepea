@@ -920,6 +920,16 @@ cdef class CursorWrapper(object):
             else:
                 counter -= 1
 
+    def __getitem__(self, value):
+        if isinstance(value, slice):
+            index = value.stop
+        else:
+            index = value
+        if index is not None:
+            index = index + 1 if index >= 0 else None
+        self.fill_cache(index)
+        return self.result_cache[value]
+
 
 cdef dict_transform(CursorWrapper cursor_wrapper, tuple row):
     cdef:

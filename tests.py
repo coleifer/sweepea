@@ -815,12 +815,15 @@ class TestQueryExecution(BaseTestCase):
             ('huey', 'purr'),
             ('mickey', 'woof')])
 
-    def test_cursor_wrappers(self):
+    def _create_people(self):
         Person.insert((
             {Person.name: 'charlie'},
             {Person.name: 'huey'},
             {Person.name: 'mickey'},
             {Person.name: 'zaizee'})).execute(database)
+
+    def test_cursor_wrappers(self):
+        self._create_people()
         query = (Person
                  .select(
                      Person.name,
@@ -842,12 +845,22 @@ class TestQueryExecution(BaseTestCase):
             ('4d5257', 'mickey'),
             ('7670f7', 'zaizee')])
 
+    def test_cursor_iteration(self):
+        self._create_people()
+        query = Person.select(Person.name).order_by(Person.name)
+        cw = query.execute(database)
+        rows = [r for r in cw]
+
+        self.assertEqual(cw[1], ('huey',))
+        self.assertEqual(cw[2], ('mickey',))
+        self.assertEqual(cw[:2], [('charlie',), ('huey',)])
+        self.assertEqual(cw[-1], ('zaizee',))
+
+        rows = [r for r, in cw]
+        self.assertEqual(rows, ['charlie', 'huey', 'mickey', 'zaizee'])
+
     def test_builtin_functions(self):
-        Person.insert((
-            {Person.name: 'charlie'},
-            {Person.name: 'huey'},
-            {Person.name: 'mickey'},
-            {Person.name: 'zaizee'})).execute(database)
+        self._create_people()
         query = (Person
                  .select(Person.name, fn.MD5(Person.name).alias('md5'))
                  .order_by(Person.name))
