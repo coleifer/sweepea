@@ -1402,7 +1402,9 @@ cdef class Database(object):
         sql = 'PRAGMA %s' % key
         if value is not __sentinel__:
             sql += ' = %s' % value
-        return self.execute_sql(sql).fetchone()
+        row = self.execute_sql(sql).fetchone()
+        if row:
+            return row[0]
 
     def begin(self, lock_type=None):
         """

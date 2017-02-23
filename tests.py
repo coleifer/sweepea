@@ -444,6 +444,34 @@ class TestHelpers(BaseTestCase):
             save('k3')
         assertRegister(['k3'])
 
+    def test_pragmas(self):
+        self.assertEqual(self._db.page_size, 4096)
+        self._db.page_size = 1024
+        self.assertEqual(self._db.page_size, 1024)
+
+        self._db.foreign_keys = 'on'
+        self.assertEqual(self._db.foreign_keys, 1)
+        self._db.foreign_keys = 'off'
+        self.assertEqual(self._db.foreign_keys, 0)
+
+    def test_db_context(self):
+        db = Database(':memory:')
+        self.assertTrue(db.is_closed())
+
+        db.connect()
+        self.assertFalse(db.is_closed())
+        self.assertRaises(sqlite3.InterfaceError, db.connect)
+
+        self.assertTrue(db.close())
+        self.assertFalse(db.close())
+        self.assertTrue(db.is_closed())
+
+        with db:
+            self.assertFalse(db.is_closed())
+            self.assertFalse(db.autocommit)
+
+        self.assertTrue(db.is_closed())
+
 
 User = Table('users', ('id', 'username', 'is_admin'))
 Tweet = Table('tweet', ('id', 'user_id', 'content', 'timestamp'))
