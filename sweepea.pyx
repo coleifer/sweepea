@@ -847,11 +847,10 @@ cdef class CursorWrapper(object):
         bint is_initialized, is_populated
         int count, index
         list columns, result_cache
-        object cursor, transform
+        object cursor
 
-    def __init__(self, cursor, transform=None):
+    def __init__(self, cursor):
         self.cursor = cursor
-        self.transform = transform
         self.is_initialized = False
         self.is_populated = False
         self.result_cache = []
@@ -880,10 +879,10 @@ cdef class CursorWrapper(object):
         elif not self.is_initialized:
             self.initialize()
 
-        if self.transform is not None:
-            return self.transform(self, row)
-        else:
-            return row
+        return self.transform(row)
+
+    cdef transform(self, tuple row):
+        return row
 
     def iterator(self):
         while True:
@@ -931,24 +930,16 @@ cdef class CursorWrapper(object):
         return self.result_cache[value]
 
 
-cdef dict_transform(CursorWrapper cursor_wrapper, tuple row):
-    cdef:
-        basestring column
-        dict accum = {}
-        int i
+cdef class DictCursorWrapper(CursorWrapper):
+    cdef transform(self, tuple row):
+        cdef:
+            basestring column
+            dict accum = {}
+            int i
+        for i, column in enumerate(self.columns):
+            accum[column] = row[i]
+        return accum
 
-    for i, column in enumerate(cursor_wrapper.columns):
-        accum[column] = row[i]
-
-    return accum
-
-def DictCursorWrapper(cursor):
-    return CursorWrapper(cursor, dict_transform)
-
-cdef class NamedTupleCursorWrapper(CursorWrapper)  # Forward declaration.
-
-cdef namedtuple_transform(NamedTupleCursorWrapper cursor_wrapper, tuple row):
-    return cursor_wrapper.tuple_class(*row)
 
 cdef class NamedTupleCursorWrapper(CursorWrapper):
     cdef:
@@ -957,7 +948,9 @@ cdef class NamedTupleCursorWrapper(CursorWrapper):
     cdef initialize(self):
         CursorWrapper.initialize(self)
         self.tuple_class = namedtuple('Row', self.columns)
-        self.transform = namedtuple_transform
+
+    cdef transform(self, tuple row):
+        return self.tuple_class(*row)
 
 
 cdef class _callable_context_manager(object):
@@ -2567,7 +2560,7 @@ class Select(SelectBase):
         self._distinct = distinct
         self._cursor = None
         self._dicts = False
-        self._objects = False
+        self._tuples = False
 
     @Node.copy
     def select(self, *columns):
@@ -2609,8 +2602,8 @@ class Select(SelectBase):
         self._dicts = as_dict
 
     @Node.copy
-    def objects(self, as_object=True):
-        self._objects = as_object
+    def tuples(self, as_tuple=True):
+        self._tuples = as_tuple
 
     def __sql__(self, Context ctx):
         super(Select, self).__sql__(ctx)
@@ -2642,10 +2635,10 @@ class Select(SelectBase):
         cursor = database.execute(self)
         if self._dicts:
             return DictCursorWrapper(cursor)
-        elif self._objects:
-            return NamedTupleCursorWrapper(cursor)
-        else:
+        elif self._tuples:
             return CursorWrapper(cursor)
+        else:
+            return NamedTupleCursorWrapper(cursor)
 
 
 class WriteQuery(Query):

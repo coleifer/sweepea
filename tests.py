@@ -838,12 +838,12 @@ class TestQueryExecution(BaseTestCase):
             {'hash': '7670f7', 'name': 'zaizee'},
         ])
 
-        objs = list(query.objects().execute(database))
-        self.assertEqual([(obj.hash, obj.name) for obj in objs], [
-            ('bf779e', 'charlie'),
-            ('ef6307', 'huey'),
-            ('4d5257', 'mickey'),
-            ('7670f7', 'zaizee')])
+        objs = list(query.tuples().execute(database))
+        self.assertEqual(objs, [
+            ('charlie', 'bf779e'),
+            ('huey', 'ef6307'),
+            ('mickey', '4d5257'),
+            ('zaizee', '7670f7')])
 
     def test_cursor_iteration(self):
         self._create_people()
