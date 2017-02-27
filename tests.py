@@ -809,6 +809,7 @@ class TestQueryExecution(BaseTestCase):
                 .join(Person, on=(Note.person_id == Person.id))
                 .order_by(-Note.timestamp)
                 .limit(3)
+                .namedtuples()
                 .execute(database))
         self.assertEqual([tuple(r) for r in curs], [
             ('huey', 'meow'),
@@ -838,7 +839,7 @@ class TestQueryExecution(BaseTestCase):
             {'hash': '7670f7', 'name': 'zaizee'},
         ])
 
-        objs = list(query.tuples().execute(database))
+        objs = list(query.execute(database))
         self.assertEqual(objs, [
             ('charlie', 'bf779e'),
             ('huey', 'ef6307'),
@@ -874,6 +875,7 @@ class TestQueryExecution(BaseTestCase):
                 .select(Person.name)
                 .where(fn.REGEXP(Person.name, '^.+ey$'))
                 .order_by(Person.name)
+                .namedtuples()
                 .execute(database))
         self.assertEqual([row.name for row in curs],
                          ['huey', 'mickey'])

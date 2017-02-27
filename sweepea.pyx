@@ -9,6 +9,7 @@ from libc.string cimport memcpy, memset
 
 from collections import namedtuple
 from contextlib import contextmanager
+from functools import partial
 import decimal
 import hashlib
 import itertools
@@ -951,6 +952,20 @@ cdef class NamedTupleCursorWrapper(CursorWrapper):
 
     cdef transform(self, tuple row):
         return self.tuple_class(*row)
+
+
+cdef class ObjectCursorWrapper(DictCursorWrapper):
+    cdef:
+        public object constructor
+
+    def __init__(self, cursor, constructor):
+        super(ObjectCursorWrapper, self).__init__(cursor)
+        self.constructor = constructor
+
+    cdef transform(self, tuple row):
+        cdef:
+            dict accum = DictCursorWrapper.transform(self, row)
+        return self.constructor(**accum)
 
 
 cdef class _callable_context_manager(object):
@@ -2510,6 +2525,10 @@ class Query(Node):
 class SelectBase(Source, Query):
     commit = False
 
+    def __init__(self, *args, **kwargs):
+        super(SelectBase, self).__init__(*args, **kwargs)
+        self._dicts = self._namedtuples = self._objects = False
+
     def __add__(self, rhs):
         return CompoundSelect(self, 'UNION ALL', rhs)
     def __or__(self, rhs):
@@ -2520,6 +2539,31 @@ class SelectBase(Source, Query):
         return CompoundSelect(self, 'EXCEPT', rhs)
     def cte(self, name, recursive=False, columns=None):
         return CTE(name, self, recursive, columns)
+
+    @Node.copy
+    def dicts(self, as_dict=True):
+        self._dicts = as_dict
+        self._namedtuples = self._objects = False
+
+    @Node.copy
+    def namedtuples(self, as_namedtuples=True):
+        self._namedtuples = as_namedtuples
+        self._dicts = self._objects = False
+
+    @Node.copy
+    def objects(self, constructor=None):
+        self._objects = constructor
+        self._dicts = self._namedtuples = False
+
+    def get_cursor_wrapper(self):
+        if self._dicts:
+            return DictCursorWrapper
+        elif self._namedtuples:
+            return NamedTupleCursorWrapper
+        elif self._objects:
+            return partial(ObjectCursorWrapper, constructor=self._objects)
+        else:
+            return CursorWrapper
 
 
 class CompoundSelect(SelectBase):
@@ -2540,7 +2584,8 @@ class CompoundSelect(SelectBase):
         return self.apply_alias(ctx)
 
     def execute(self, database):
-        return CursorWrapper(database.execute(self))
+        cursor_wrapper_cls = self.get_cursor_wrapper()
+        return cursor_wrapper_cls(database.execute(self))
 
 
 class Select(SelectBase):
@@ -2559,8 +2604,6 @@ class Select(SelectBase):
         self._offset = offset
         self._distinct = distinct
         self._cursor = None
-        self._dicts = False
-        self._tuples = False
 
     @Node.copy
     def select(self, *columns):
@@ -2597,14 +2640,6 @@ class Select(SelectBase):
     def distinct(self, is_distinct=True):
         self._distinct = is_distinct
 
-    @Node.copy
-    def dicts(self, as_dict=True):
-        self._dicts = as_dict
-
-    @Node.copy
-    def tuples(self, as_tuple=True):
-        self._tuples = as_tuple
-
     def __sql__(self, Context ctx):
         super(Select, self).__sql__(ctx)
         is_subquery = ctx.subquery
@@ -2632,13 +2667,8 @@ class Select(SelectBase):
         return self.apply_alias(ctx)
 
     def execute(self, Database database):
-        cursor = database.execute(self)
-        if self._dicts:
-            return DictCursorWrapper(cursor)
-        elif self._tuples:
-            return CursorWrapper(cursor)
-        else:
-            return NamedTupleCursorWrapper(cursor)
+        cursor_wrapper_cls = self.get_cursor_wrapper()
+        return cursor_wrapper_cls(database.execute(self))
 
 
 class WriteQuery(Query):
@@ -2786,6 +2816,7 @@ class Delete(WriteQuery):
     def execute(self, Database database):
         database.execute(self)
         return database.changes()
+
 
 SQLITE_DATETIME_FORMATS = (
     '%Y-%m-%d %H:%M:%S',
