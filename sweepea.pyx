@@ -251,18 +251,18 @@ cdef extern from "_pysqlite/connection.h":
         char* begin_statement
 
 
-# The peewee_vtab struct embeds the base sqlite3_vtab struct, and adds a field
+# The sweepea_vtab struct embeds the base sqlite3_vtab struct, and adds a field
 # to store a reference to the Python implementation.
-ctypedef struct peewee_vtab:
+ctypedef struct sweepea_vtab:
     sqlite3_vtab base
     void *table_func_cls
 
 
-# Like peewee_vtab, the peewee_cursor embeds the base sqlite3_vtab_cursor and
+# Like sweepea_vtab, the sweepea_cursor embeds the base sqlite3_vtab_cursor and
 # adds fields to store references to the current index, the Python
 # implementation, the current rows' data, and a flag for whether the cursor has
 # been exhausted.
-ctypedef struct peewee_cursor:
+ctypedef struct sweepea_cursor:
     sqlite3_vtab_cursor base
     long long idx
     void *table_func
@@ -277,13 +277,13 @@ cdef int pwConnect(sqlite3 *db, void *pAux, int argc, char **argv,
     cdef:
         int rc
         object table_func_cls = <object>pAux
-        peewee_vtab *pNew
+        sweepea_vtab *pNew
 
     rc = sqlite3_declare_vtab(
         db,
         'CREATE TABLE x(%s);' % table_func_cls.get_table_columns_declaration())
     if rc == SQLITE_OK:
-        pNew = <peewee_vtab *>sqlite3_malloc(sizeof(pNew[0]))
+        pNew = <sweepea_vtab *>sqlite3_malloc(sizeof(pNew[0]))
         memset(<char *>pNew, 0, sizeof(pNew[0]))
         ppVtab[0] = &(pNew.base)
 
@@ -295,7 +295,7 @@ cdef int pwConnect(sqlite3 *db, void *pAux, int argc, char **argv,
 
 cdef int pwDisconnect(sqlite3_vtab *pBase) with gil:
     cdef:
-        peewee_vtab *pVtab = <peewee_vtab *>pBase
+        sweepea_vtab *pVtab = <sweepea_vtab *>pBase
         object table_func_cls = <object>(pVtab.table_func_cls)
 
     Py_DECREF(table_func_cls)
@@ -307,11 +307,11 @@ cdef int pwDisconnect(sqlite3_vtab *pBase) with gil:
 # instantiate the TableFunction class and zero out a new cursor for iteration.
 cdef int pwOpen(sqlite3_vtab *pBase, sqlite3_vtab_cursor **ppCursor) with gil:
     cdef:
-        peewee_vtab *pVtab = <peewee_vtab *>pBase
-        peewee_cursor *pCur
+        sweepea_vtab *pVtab = <sweepea_vtab *>pBase
+        sweepea_cursor *pCur
         object table_func_cls = <object>pVtab.table_func_cls
 
-    pCur = <peewee_cursor *>sqlite3_malloc(sizeof(pCur[0]))
+    pCur = <sweepea_cursor *>sqlite3_malloc(sizeof(pCur[0]))
     memset(<char *>pCur, 0, sizeof(pCur[0]))
     ppCursor[0] = &(pCur.base)
     pCur.idx = 0
@@ -324,7 +324,7 @@ cdef int pwOpen(sqlite3_vtab *pBase, sqlite3_vtab_cursor **ppCursor) with gil:
 
 cdef int pwClose(sqlite3_vtab_cursor *pBase) with gil:
     cdef:
-        peewee_cursor *pCur = <peewee_cursor *>pBase
+        sweepea_cursor *pCur = <sweepea_cursor *>pBase
         object table_func = <object>pCur.table_func
     Py_DECREF(table_func)
     sqlite3_free(pCur)
@@ -332,10 +332,10 @@ cdef int pwClose(sqlite3_vtab_cursor *pBase) with gil:
 
 
 # Iterate once, advancing the cursor's index and assigning the row data to the
-# `row_data` field on the peewee_cursor struct.
+# `row_data` field on the sweepea_cursor struct.
 cdef int pwNext(sqlite3_vtab_cursor *pBase) with gil:
     cdef:
-        peewee_cursor *pCur = <peewee_cursor *>pBase
+        sweepea_cursor *pCur = <sweepea_cursor *>pBase
         object table_func = <object>pCur.table_func
         tuple result
 
@@ -361,7 +361,7 @@ cdef int pwNext(sqlite3_vtab_cursor *pBase) with gil:
 cdef int pwColumn(sqlite3_vtab_cursor *pBase, sqlite3_context *ctx,
                   int iCol) with gil:
     cdef:
-        peewee_cursor *pCur = <peewee_cursor *>pBase
+        sweepea_cursor *pCur = <sweepea_cursor *>pBase
         sqlite3_int64 x = 0
         tuple row_data
 
@@ -394,7 +394,7 @@ cdef int pwColumn(sqlite3_vtab_cursor *pBase, sqlite3_context *ctx,
 
 cdef int pwRowid(sqlite3_vtab_cursor *pBase, sqlite3_int64 *pRowid):
     cdef:
-        peewee_cursor *pCur = <peewee_cursor *>pBase
+        sweepea_cursor *pCur = <sweepea_cursor *>pBase
     pRowid[0] = <sqlite3_int64>pCur.idx
     return SQLITE_OK
 
@@ -402,7 +402,7 @@ cdef int pwRowid(sqlite3_vtab_cursor *pBase, sqlite3_int64 *pRowid):
 # Return a boolean indicating whether the cursor has been consumed.
 cdef int pwEof(sqlite3_vtab_cursor *pBase):
     cdef:
-        peewee_cursor *pCur = <peewee_cursor *>pBase
+        sweepea_cursor *pCur = <sweepea_cursor *>pBase
     if pCur.stopped:
         return 1
     return 0
@@ -414,7 +414,7 @@ cdef int pwEof(sqlite3_vtab_cursor *pBase):
 cdef int pwFilter(sqlite3_vtab_cursor *pBase, int idxNum,
                   const char *idxStr, int argc, sqlite3_value **argv) with gil:
     cdef:
-        peewee_cursor *pCur = <peewee_cursor *>pBase
+        sweepea_cursor *pCur = <sweepea_cursor *>pBase
         object table_func = <object>pCur.table_func
         dict query = {}
         int idx
@@ -469,7 +469,7 @@ cdef int pwBestIndex(sqlite3_vtab *pBase, sqlite3_index_info *pIdxInfo) \
     cdef:
         int i
         int idxNum = 0, nArg = 0
-        peewee_vtab *pVtab = <peewee_vtab *>pBase
+        sweepea_vtab *pVtab = <sweepea_vtab *>pBase
         object table_func_cls = <object>pVtab.table_func_cls
         sqlite3_index_constraint *pConstraint
         list columns = []
@@ -643,10 +643,10 @@ cdef float rank(object raw_match_info):
             x1, x2 = match_info[col_idx:col_idx + 2]
             if x1 > 0:
                 score += float(x1) / x2
-    return score
+    return -score
 
 
-cdef float bm25(object raw_match_info, int column_index, float k1, float b):
+cdef float bm25(object raw_match_info, int column_index):
     """
     Okapi BM25 ranking implementation (FTS4 only).
 
@@ -657,12 +657,12 @@ cdef float bm25(object raw_match_info, int column_index, float k1, float b):
     cdef:
         float avg_length, doc_length, D, term_freq, term_matches, idf
         float denom, rhs, score
+        float k1 = 1.2
+        float b = 0.75
         int p, c, n_idx, a_idx, l_idx, n
         int total_docs, x_idx
         list match_info, a, l
 
-    k1 = k1 or 1.2
-    b = b or 0.75
     match_info = _parse_match_info(raw_match_info)
     score = 0.0
     # p, 1 --> num terms
@@ -716,7 +716,7 @@ cdef float bm25(object raw_match_info, int column_index, float k1, float b):
 
         score += (idf * rhs)
 
-    return score
+    return -score
 
 
 cdef unsigned int murmurhash2(const char *key, int nlen, unsigned int seed):
@@ -866,16 +866,18 @@ class DateSeries(TableFunction):
     def initialize(self, start, stop, step_seconds=86400):
         self.start = format_datetime(start)
         self.stop = format_datetime(stop)
-        step_seconds = int(step_seconds)
-        self.step_seconds = datetime.timedelta(seconds=step_seconds)
+        self.step_seconds_i = int(step_seconds)
+        self.step_seconds = datetime.timedelta(seconds=self.step_seconds_i)
+        self.format = self.get_format()
 
-        if self.is_zero_time(self.start) and step_seconds >= 86400:
-            self.format = '%Y-%m-%d'
+    def get_format(self):
+        if self.is_zero_time(self.start) and self.step_seconds_i >= 86400:
+            return '%Y-%m-%d'
         elif self.is_zero_date(self.start) and self.is_zero_date(self.stop) \
-                and step_seconds < 86400:
-            self.format = '%H:%M:%S'
+                and self.step_seconds_i < 86400:
+            return '%H:%M:%S'
         else:
-            self.format = '%Y-%m-%d %H:%M:%S'
+            return '%Y-%m-%d %H:%M:%S'
 
     def is_zero_time(self, dt):
         return dt.hour == dt.minute == dt.second == 0
@@ -917,6 +919,9 @@ cdef int _aggressive_busy_handler(void *ptr, int n):
         sqlite3_sleep(current)
         return 1
     return 0
+
+
+class DoesNotExist(Exception): pass
 
 
 cdef class CursorWrapper(object)  # Forward declaration.
@@ -985,7 +990,8 @@ cdef class CursorWrapper(object):
         return self.count
 
     cdef initialize(self):
-        self.columns = [col[0] for col in self.cursor.description]
+        self.columns = [col[0][col[0].find('.') + 1:]
+                        for col in self.cursor.description]
 
     def iterate(self, cache=True):
         cdef:
@@ -1023,6 +1029,22 @@ cdef class CursorWrapper(object):
                 iterator.next()
             except StopIteration:
                 break
+
+    cpdef first(self):
+        if not self.is_populated:
+            self.fill_cache(1)
+        if self.result_cache:
+            return self.result_cache[0]
+
+    cpdef get(self):
+        obj = self.first()
+        if obj is None:
+            raise DoesNotExist('No objects found matching this query.')
+        else:
+            return obj
+
+    cpdef scalar(self):
+        return self.get()[0]
 
 
 cdef class DictCursorWrapper(CursorWrapper):
@@ -2683,12 +2705,6 @@ class Query(Node):
         self._limit = limit
         self._offset = offset
         self._cte_list = None
-        self._cursor = None
-
-    def clone(self):
-        query = super(Query, self).clone()
-        query._cursor = None
-        return query
 
     @Node.copy
     def with_cte(self, *cte_list):
@@ -2768,6 +2784,12 @@ class SelectBase(Source, Query):
         self._namedtuples = False
         self._objects = False
         self._query_name = 'sq'
+        self._cursor = None
+
+    def clone(self):
+        query = super(SelectBase, self).clone()
+        query._cursor = None
+        return query
 
     def cte(self, name, recursive=False, columns=None):
         return CTE(name, self, recursive, columns)
@@ -2797,6 +2819,12 @@ class SelectBase(Source, Query):
         else:
             return CursorWrapper
 
+    def execute(self, database):
+        if self._cursor is None:
+            cursor_wrapper_cls = self.get_cursor_wrapper()
+            self._cursor = cursor_wrapper_cls(database.execute(self))
+        return self._cursor
+
 
 class CompoundSelect(SelectBase):
     def __init__(self, lhs, op, rhs):
@@ -2819,9 +2847,19 @@ class CompoundSelect(SelectBase):
         ctx = self.apply_ordering(ctx)
         return self.apply_alias(ctx)
 
-    def execute(self, database):
-        cursor_wrapper_cls = self.get_cursor_wrapper()
-        return cursor_wrapper_cls(database.execute(self))
+    def exists(self, database):
+        clone = self.select(SQL('1'))
+        clone._limit = 1
+        clone._offset = None
+        return bool(clone.execute(database).scalar())
+
+    def count(self, database, clear_limit=False):
+        clone = self.order_by().alias('_wrapped')
+        if clear_limit:
+            clone._limit = clone._offset = None
+
+        query = Select([clone], [fn.COUNT(SQL('1'))]).tuples()
+        return query.execute(database)[0][0]
 
 
 class Select(SelectBase):
@@ -2914,10 +2952,6 @@ class Select(SelectBase):
             self.apply_ordering(ctx)
 
         return self.apply_alias(ctx)
-
-    def execute(self, Database database):
-        cursor_wrapper_cls = self.get_cursor_wrapper()
-        return cursor_wrapper_cls(database.execute(self))
 
 
 class WriteQuery(Query):
