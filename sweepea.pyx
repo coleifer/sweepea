@@ -2244,7 +2244,7 @@ class BaseTable(Source):
 
 class Table(BaseTable):
     def __init__(self, name, columns=None, schema=None, alias=None):
-        self.name = self._query_name = name
+        self._name = self._query_name = name
         self._columns = columns
         self._schema = schema
         self._path = (self._schema, name) if self._schema else (name,)
@@ -2256,7 +2256,7 @@ class Table(BaseTable):
                 setattr(self, column, Column(self, column))
 
     def clone(self):
-        return Table(self.name, self._columns, schema=self._schema,
+        return Table(self._name, self._columns, schema=self._schema,
                      alias=self._alias)
 
     def select(self, *selection):
@@ -2410,7 +2410,7 @@ class Column(ColumnBase):
         if ctx.scope == SCOPE_VALUES:
             return ctx.sql(Entity(self.name))
         else:
-            with ctx.scope_normal():
+            with ctx.scope_column():
                 return ctx.sql(self.source).literal('.').sql(Entity(self.name))
 
 
@@ -2808,6 +2808,10 @@ class Select(SelectBase):
     @Node.copy
     def select(self, *columns):
         self._columns = columns
+
+    @Node.copy
+    def from_(self, *sources):
+        self._from = list(sources)
 
     @Node.copy
     def join(self, dest, join_type='INNER', on=None):
