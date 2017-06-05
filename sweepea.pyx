@@ -864,8 +864,8 @@ class DateSeries(TableFunction):
     name = 'date_series'
 
     def initialize(self, start, stop, step_seconds=86400):
-        self.start = format_date_time_sqlite(start)
-        self.stop = format_date_time_sqlite(stop)
+        self.start = format_datetime(start)
+        self.stop = format_datetime(stop)
         step_seconds = int(step_seconds)
         self.step_seconds = datetime.timedelta(seconds=step_seconds)
 
@@ -3035,6 +3035,8 @@ class Insert(WriteQuery):
                 ctx = self._simple_insert(ctx)
             elif isinstance(self.data, SelectBase):
                 ctx = self._query_insert(ctx)
+            elif self.data is None:
+                ctx.literal('DEFAULT VALUES')
             else:
                 ctx = self._multi_insert(ctx)
         return ctx

@@ -693,7 +693,7 @@ class TestQueryBuilder(BaseTestCase):
             'SELECT "top_regions"."region" '
             'FROM "top_regions")'
             ') GROUP BY "orders"."region", "orders"."product"'), [10])
-"""
+
     def test_compound_select(self):
         lhs = User.select(User.c.id).where(User.c.username == 'charlie')
         rhs = User.select(User.c.username).where(User.c.admin == True)
@@ -702,13 +702,13 @@ class TestQueryBuilder(BaseTestCase):
         q3 = q2 | UA.select(UA.c.id).where(UA.c.superuser == False)
 
         self.assertSQL(q3, (
-            'SELECT "t1"."id" '
-            'FROM "users" AS "t1" '
-            'WHERE ("t1"."username" = ?) '
+            'SELECT "users"."id" '
+            'FROM "users" '
+            'WHERE ("users"."username" = ?) '
             'UNION '
-            'SELECT "t2"."username" '
-            'FROM "users" AS "t2" '
-            'WHERE ("t2"."admin" = ?) '
+            'SELECT "users"."username" '
+            'FROM "users" '
+            'WHERE ("users"."admin" = ?) '
             'UNION '
             'SELECT "U2"."id" '
             'FROM "users" AS "U2" '
@@ -720,17 +720,98 @@ class TestQueryBuilder(BaseTestCase):
                  .select(Tweet.c.content)
                  .join(inner, on=(Tweet.c.user_id == inner.c.id)))
         self.assertSQL(query, (
-            'SELECT "t1"."content" FROM "tweets" AS "t1" '
-            'INNER JOIN (SELECT "t2"."id" FROM "users" AS "t2") AS "j1" '
-            'ON ("t1"."user_id" = "j1"."id")'), [])
+            'SELECT "tweets"."content" FROM "tweets" '
+            'INNER JOIN (SELECT "users"."id" FROM "users") AS "j1" '
+            'ON ("tweets"."user_id" = "j1"."id")'), [])
 
     def test_join_on_misc(self):
         cond = fn.Magic(Person.id, Note.id).alias('magic')
         query = Person.select(Person.id).join(Note, on=cond)
         self.assertSQL(query, (
-            'SELECT "t1"."id" FROM "person" AS "t1" '
-            'INNER JOIN "note" AS "t2" '
-            'ON Magic("t1"."id", "t2"."id") AS "magic"'), [])
+            'SELECT "person"."id" FROM "person" '
+            'INNER JOIN "note" '
+            'ON Magic("person"."id", "note"."id") AS "magic"'), [])
+
+    def test_select_integration(self):
+        query = User.select(User.c.username).where(User.c.is_admin == True)
+        self.assertSQL(query, (
+            'SELECT "users"."username" FROM "users" '
+            'WHERE ("users"."is_admin" = ?)'), [True])
+
+        # Test wide range of SELECT query methods.
+        query = (User
+                 .select(User.c.username, fn.COUNT(Tweet.c.id).alias('ct'))
+                 .left_outer_join(Tweet, on=(Tweet.c.user_id == User.c.id))
+                 .where(User.c.is_admin == True)
+                 .group_by(User.c.username)
+                 .having(fn.COUNT(Tweet.c.id) > 1)
+                 .order_by(SQL('ct').desc(), User.c.username.asc())
+                 .limit(10))
+        self.assertSQL(query, (
+            'SELECT "users"."username", COUNT("tweets"."id") AS "ct" '
+            'FROM "users" '
+            'LEFT OUTER JOIN "tweets" ON ("tweets"."user_id" = "users"."id") '
+            'WHERE ("users"."is_admin" = ?) '
+            'GROUP BY "users"."username" '
+            'HAVING (COUNT("tweets"."id") > ?) '
+            'ORDER BY ct DESC, "users"."username" ASC '
+            'LIMIT 10'), [True, 1])
+
+    def test_joins_integration(self):
+        Flag = Table('flag', ('id', 'tweet_id', 'flag_type'))
+        Avatar = Table('avatar', ('id', 'user_id', 'url'))
+        q = (User
+             .select(User.c.username, Avatar.url, Tweet.c.content)
+             .join(Tweet, on=(Tweet.c.user_id == User.c.id))
+             .join(Flag, on=(Flag.tweet_id == Tweet.c.id))
+             .join(Avatar, on=(Avatar.user_id == User.c.id))
+             .where(Flag.flag_type != 'nuggie')
+             .group_by(User.c.username, Avatar.url, Tweet.c.content)
+             .having(fn.COUNT(Flag.id) == 0))
+        self.assertSQL(q, (
+            'SELECT "users"."username", "avatar"."url", "tweets"."content" '
+            'FROM "users" '
+            'INNER JOIN "tweets" ON ("tweets"."user_id" = "users"."id") '
+            'INNER JOIN "flag" ON ("flag"."tweet_id" = "tweets"."id") '
+            'INNER JOIN "avatar" ON ("avatar"."user_id" = "users"."id") '
+            'WHERE ("flag"."flag_type" != ?) '
+            'GROUP BY "users"."username", "avatar"."url", "tweets"."content" '
+            'HAVING (COUNT("flag"."id") = ?)'), ['nuggie', 0])
+
+    def test_compound_integration(self):
+        q1 = (User
+              .select(User.c.id, User.c.username)
+              .where(User.c.is_admin == True))
+
+        U2 = User.alias('u2')
+        q2 = (U2
+              .select(U2.c.id, U2.c.username)
+              .where(U2.c.username << ('foo', 'bar', 'baz')))
+
+        q = (q1 | q2).order_by(SQL('1')).limit(10)
+        self.assertSQL(q, (
+            'SELECT "users"."id", "users"."username" '
+            'FROM "users" WHERE ("users"."is_admin" = ?) '
+            'UNION '
+            'SELECT "u2"."id", "u2"."username" '
+            'FROM "users" AS "u2" '
+            'WHERE ("u2"."username" IN (?, ?, ?)) '
+            'ORDER BY 1 LIMIT 10'), [True, 'foo', 'bar', 'baz'])
+
+        U3 = User.alias('u3')
+        q3 = q & U3.select(U3.c.id, U3.c.username).where(U3.c.id > 100)
+        self.assertSQL(q3, (
+            'SELECT "users"."id", "users"."username" '
+            'FROM "users" WHERE ("users"."is_admin" = ?) '
+            'UNION '
+            'SELECT "u2"."id", "u2"."username" '
+            'FROM "users" AS "u2" '
+            'WHERE ("u2"."username" IN (?, ?, ?)) '
+            'ORDER BY 1 LIMIT 10 '
+            'INTERSECT '
+            'SELECT "u3"."id", "u3"."username" '
+            'FROM "users" AS "u3" WHERE ("u3"."id" > ?)'),
+            [True, 'foo', 'bar', 'baz', 100])
 
 
 class TestInsertQuery(BaseTestCase):
@@ -758,55 +839,45 @@ class TestInsertQuery(BaseTestCase):
         query = Person.insert(source, columns=[Person.name])
         self.assertSQL(query, (
             'INSERT INTO "person" ("name") '
-            'SELECT "t1"."username" FROM "users" AS "t1" '
-            'WHERE ("t1"."admin" = ?)'), [False])
+            'SELECT "users"."username" FROM "users" '
+            'WHERE ("users"."admin" = ?)'), [False])
 
     def test_insert_query_cte(self):
         cte = User.select(User.c.username).cte('foo')
         source = cte.select(cte.c.username)
         query = Person.insert(source, columns=[Person.name]).with_cte(cte)
         self.assertSQL(query, (
-            'WITH "foo" AS (SELECT "t1"."username" FROM "users" AS "t1") '
+            'WITH "foo" AS (SELECT "users"."username" FROM "users") '
             'INSERT INTO "person" ("name") '
             'SELECT "foo"."username" FROM "foo"'), [])
 
-    def test_insert_returning(self):
-        query = (Person
-                 .insert({
-                     Person.name: 'zaizee',
-                     Person.dob: datetime.date(2000, 1, 2)})
-                 .returning(Person.id, Person.name, Person.dob))
-        self.assertSQL(query, (
-            'INSERT INTO "person" ("dob", "name") '
-            'VALUES (?, ?) RETURNING "id", "name", "dob"'),
-            [datetime.date(2000, 1, 2), 'zaizee'])
-
     def test_empty(self):
-        class Empty(TestModel): pass
-        query = Empty.insert()
-        if isinstance(db, MySQLDatabase):
-            sql = 'INSERT INTO "empty" () VALUES ()'
-        elif isinstance(db, PostgresqlDatabase):
-            sql = 'INSERT INTO "empty" DEFAULT VALUES RETURNING "id"'
-        else:
-            sql = 'INSERT INTO "empty" DEFAULT VALUES'
-        self.assertSQL(query, sql, [])
+        query = Table('empty').insert()
+        self.assertSQL(query, 'INSERT INTO "empty" DEFAULT VALUES', [])
 
 
 class TestUpdateQuery(BaseTestCase):
     def test_update_query(self):
         query = (User
-                 .update({
-                     User.c.username: 'nuggie',
-                     User.c.admin: False,
-                     User.c.counter: User.c.counter + 1})
+                 .update({User.c.counter: User.c.counter + 1})
                  .where(User.c.username == 'nugz'))
         self.assertSQL(query, (
             'UPDATE "users" SET '
-            '"admin" = ?, '
-            '"counter" = ("counter" + ?), '
-            '"username" = ? '
-            'WHERE ("username" = ?)'), [False, 1, 'nuggie', 'nugz'])
+            '"counter" = ("counter" + ?) '
+            'WHERE ("username" = ?)'), [1, 'nugz'])
+
+    def test_update_multi_set(self):
+        Stat = Table('stat', ('id', 'key', 'counter'))
+        query = (Stat
+                 .update(O(
+                     (Stat.key, 'k1'),
+                     (Stat.counter, Stat.counter + 1)))
+                 .where(Stat.key == 'k2'))
+        self.assertSQL(query, (
+            'UPDATE "stat" SET '
+            '"key" = ?, '
+            '"counter" = ("counter" + ?) '
+            'WHERE ("key" = ?)'), ['k1', 1, 'k2'])
 
     def test_update_subquery(self):
         subquery = (User
@@ -815,30 +886,18 @@ class TestUpdateQuery(BaseTestCase):
                     .group_by(User.c.id)
                     .having(SQL('ct') > 100))
         query = (User
-                 .update({
-                     User.c.muted: True,
-                     User.c.counter: 0})
+                 .update({User.c.muted: True})
                  .where(User.c.id << subquery))
         self.assertSQL(query, (
             'UPDATE "users" SET '
-            '"counter" = ?, '
             '"muted" = ? '
             'WHERE ("id" IN ('
-            'SELECT "users"."id", COUNT("t1"."id") AS "ct" '
-            'FROM "users" AS "users" '
-            'INNER JOIN "tweets" AS "t1" '
-            'ON ("t1"."user_id" = "users"."id") '
+            'SELECT "users"."id", COUNT("tweets"."id") AS "ct" '
+            'FROM "users" '
+            'INNER JOIN "tweets" '
+            'ON ("tweets"."user_id" = "users"."id") '
             'GROUP BY "users"."id" '
-            'HAVING (ct > ?)))'), [0, True, 100])
-
-    def test_update_returning(self):
-        query = (User
-                 .update({User.c.is_admin: True})
-                 .where(User.c.username == 'charlie')
-                 .returning(User.c.id))
-        self.assertSQL(query, (
-            'UPDATE "users" SET "is_admin" = ? WHERE ("username" = ?) '
-            'RETURNING "id"'), [True, 'charlie'])
+            'HAVING (ct > ?)))'), [True, 100])
 
 
 class TestDeleteQuery(BaseTestCase):
@@ -864,9 +923,9 @@ class TestDeleteQuery(BaseTestCase):
         self.assertSQL(query, (
             'DELETE FROM "users" '
             'WHERE ("id" IN ('
-            'SELECT "users"."id", COUNT("t1"."id") AS "ct" '
-            'FROM "users" AS "users" '
-            'INNER JOIN "tweets" AS "t1" ON ("t1"."user_id" = "users"."id") '
+            'SELECT "users"."id", COUNT("tweets"."id") AS "ct" '
+            'FROM "users" '
+            'INNER JOIN "tweets" ON ("tweets"."user_id" = "users"."id") '
             'GROUP BY "users"."id" '
             'HAVING (ct > ?)))'), [100])
 
@@ -881,353 +940,70 @@ class TestDeleteQuery(BaseTestCase):
                  .with_cte(cte))
         self.assertSQL(query, (
             'WITH "u" AS '
-            '(SELECT "t1"."id" FROM "users" AS "t1" WHERE ("t1"."admin" = ?)) '
+            '(SELECT "users"."id" FROM "users" WHERE ("users"."admin" = ?)) '
             'DELETE FROM "users" '
             'WHERE ("id" IN (SELECT "u"."id" FROM "u"))'), [True])
-
-    def test_delete_returning(self):
-        query = (User
-                 .delete()
-                 .where(User.c.id > 2)
-                 .returning(User.c.username))
-        self.assertSQL(query, (
-            'DELETE FROM "users" '
-            'WHERE ("id" > ?) '
-            'RETURNING "username"'), [2])
-
-        query = query.returning(User.c.id, User.c.username, SQL('1'))
-        self.assertSQL(query, (
-            'DELETE FROM "users" '
-            'WHERE ("id" > ?) '
-            'RETURNING "id", "username", 1'), [2])
-
-    def test_select(self):
-        q = User.select().where(User.is_admin == True)
-        self.assertSQL(q, ('SELECT "users"."id", "users"."username", '
-                               '"users"."is_admin" '
-                               'FROM "users" '
-                               'WHERE ("users"."is_admin" = ?)'))
-        self.assertEqual(params, [True])
-
-        # Test wide range of SELECT query methods.
-        q = (User
-             .select(User.username, fn.COUNT(Tweet.id).alias('ct'))
-             .left_outer_join(Tweet, on=(Tweet.user_id == User.id))
-             .where(User.is_admin == True)
-             .group_by(User.username)
-             .having(fn.COUNT(Tweet.id) > 1)
-             .order_by(SQL('ct').desc(), User.username.asc())
-             .limit(10))
-        sql, params = __sql__(q)
-        self.assertEqual(sql, (
-            'SELECT "users"."username", COUNT("tweet"."id") AS "ct" '
-            'FROM "users" '
-            'LEFT OUTER JOIN "tweet" ON ("tweet"."user_id" = "users"."id") '
-            'WHERE ("users"."is_admin" = ?) '
-            'GROUP BY "users"."username" '
-            'HAVING (COUNT("tweet"."id") > ?) '
-            'ORDER BY ct DESC, "users"."username" ASC '
-            'LIMIT 10'))
-        self.assertEqual(params, [True, 1])
-
-    def test_subquery(self):
-        inner = (Tweet
-                 .select(fn.COUNT(Tweet.id).alias('ct'))
-                 .where(Tweet.user_id == User.id))
-        query = (User
-                 .select(User.username, inner.alias('iq'))
-                 .order_by(User.username))
-        sql, params = __sql__(query)
-        self.assertEqual(sql, (
-            'SELECT "users"."username", '
-            '(SELECT COUNT("tweet"."id") AS "ct" '
-            'FROM "tweet" '
-            'WHERE ("tweet"."user_id" = "users"."id")) AS "iq" '
-            'FROM "users" ORDER BY "users"."username"'))
-        self.assertEqual(params, [])
-
-    def test_user_defined_alias(self):
-        UA = User.alias('alt')
-        query = (User
-                 .select(User.id, User.username, UA.is_admin)
-                 .join(UA, on=(User.id == UA.id))
-                 .order_by(UA.is_admin))
-        ctx = Context()
-        ctx.sql(query)
-        sql, params = __sql__(query)
-        self.assertEqual(sql, (
-            'SELECT "users"."id", "users"."username", "alt"."is_admin" '
-            'FROM "users" '
-            'INNER JOIN "users" AS "alt" ON ("users"."id" = "alt"."id") '
-            'ORDER BY "alt"."is_admin"'))
-
-    def test_multi_join_select(self):
-        Flag = Table('flag', ('id', 'tweet_id', 'flag_type'))
-        Avatar = Table('avatar', ('id', 'user_id', 'url'))
-        q = (User
-             .select(User.username, Avatar.url, Tweet.content)
-             .join(Tweet, on=(Tweet.user_id == User.id))
-             .join(Flag, on=(Flag.tweet_id == Tweet.id))
-             .join(Avatar, on=(Avatar.user_id == User.id))
-             .where(Flag.flag_type != 'nuggie')
-             .group_by(User.username, Avatar.url, Tweet.content)
-             .having(fn.COUNT(Flag.id) == 0))
-        sql, params = __sql__(q)
-        self.assertEqual(sql, (
-            'SELECT "users"."username", "avatar"."url", "tweet"."content" '
-            'FROM "users" '
-            'INNER JOIN "tweet" ON ("tweet"."user_id" = "users"."id") '
-            'INNER JOIN "flag" ON ("flag"."tweet_id" = "tweet"."id") '
-            'INNER JOIN "avatar" ON ("avatar"."user_id" = "users"."id") '
-            'WHERE ("flag"."flag_type" != ?) '
-            'GROUP BY "users"."username", "avatar"."url", "tweet"."content" '
-            'HAVING (COUNT("flag"."id") = ?)'))
-        self.assertEqual(params, ['nuggie', 0])
-
-    def test_compound_query(self):
-        U2 = User.alias('u2')
-        q1 = User.select().where(User.is_admin == True)
-        q2 = U2.select().where(U2.username << ('foo', 'bar', 'baz'))
-        q = (q1 | q2).order_by(SQL('1')).limit(10)
-        sql, params = __sql__(q)
-        self.assertEqual(sql, (
-            'SELECT "users"."id", "users"."username", "users"."is_admin" '
-            'FROM "users" WHERE ("users"."is_admin" = ?) '
-            'UNION '
-            'SELECT "u2"."id", "u2"."username", "u2"."is_admin" '
-            'FROM "users" AS "u2" '
-            'WHERE ("u2"."username" IN (?, ?, ?)) '
-            'ORDER BY 1 LIMIT 10'))
-        self.assertEqual(params, [True, 'foo', 'bar', 'baz'])
-
-        U3 = User.alias('u3')
-        q3 = q & U3.select().where(U3.id > 100)
-        sql, params = __sql__(q3)
-        self.assertEqual(sql, (
-            'SELECT "users"."id", "users"."username", "users"."is_admin" '
-            'FROM "users" WHERE ("users"."is_admin" = ?) '
-            'UNION '
-            'SELECT "u2"."id", "u2"."username", "u2"."is_admin" '
-            'FROM "users" AS "u2" '
-            'WHERE ("u2"."username" IN (?, ?, ?)) '
-            'ORDER BY 1 LIMIT 10 '
-            'INTERSECT '
-            'SELECT "u3"."id", "u3"."username", "u3"."is_admin" '
-            'FROM "users" AS "u3" WHERE ("u3"."id" > ?)'))
-        self.assertEqual(params, [True, 'foo', 'bar', 'baz', 100])
-
-    def test_cte(self):
-        Order = Table('orders', columns=(
-            'region',
-            'amount',
-            'product',
-            'quantity'))
-
-        regional_sales = (Order
-                          .select(Order.region,
-                                  fn.SUM(Order.amount).alias('total_sales'))
-                          .group_by(Order.region)
-                          .cte('regional_sales'))
-        top_regions = (regional_sales
-                       .select(regional_sales.c.region)
-                       .where(regional_sales.c.total_sales > (
-                           regional_sales.select(
-                               fn.SUM(regional_sales.c.total_sales) / 10)))
-                       .cte('top_regions'))
-        query = (Order
-                 .select(
-                     Order.region,
-                     Order.product,
-                     fn.SUM(Order.quantity).alias('product_units'),
-                     fn.SUM(Order.amount).alias('product_sales'))
-                 .where(
-                     Order.region << top_regions.select(top_regions.c.region))
-                 .group_by(Order.region, Order.product)
-                 .with_cte(regional_sales, top_regions))
-        sql, params = __sql__(query)
-        self.assertEqual(sql, (
-            'WITH "regional_sales" AS ('
-            'SELECT "orders"."region", SUM("orders"."amount") AS "total_sales" '
-            'FROM "orders" '
-            'GROUP BY "orders"."region"'
-            '), '
-            '"top_regions" AS ('
-            'SELECT "regional_sales"."region" '
-            'FROM "regional_sales" '
-            'WHERE ("regional_sales"."total_sales" > '
-            '(SELECT (SUM("regional_sales"."total_sales") / ?) '
-            'FROM "regional_sales"))'
-            ') '
-            'SELECT "orders"."region", "orders"."product", '
-            'SUM("orders"."quantity") AS "product_units", '
-            'SUM("orders"."amount") AS "product_sales" '
-            'FROM "orders" '
-            'WHERE ('
-            '"orders"."region" IN ('
-            'SELECT "top_regions"."region" '
-            'FROM "top_regions")'
-            ') GROUP BY "orders"."region", "orders"."product"'))
-        self.assertEqual(params, [10])
-
-    def test_insert_simple(self):
-        query = User.insert(O(
-            (User.username, 'charlie'),
-            (User.is_admin, False)))
-        sql, params = __sql__(query)
-        self.assertEqual(sql, (
-            'INSERT INTO "users" ("username", "is_admin") '
-            'VALUES (?, ?)'))
-        self.assertEqual(params, ['charlie', False])
-
-    def test_insert_multi(self):
-        data = [
-            O((User.username, 'foo'), (User.is_admin, True)),
-            O((User.username, 'bar'), (User.is_admin, False)),
-            O((User.username, 'baz'), (User.is_admin, False))]
-        query = User.insert(data)
-        sql, params = __sql__(query)
-        self.assertEqual(sql, (
-            'INSERT INTO "users" ("username", "is_admin") '
-            'VALUES (?, ?), (?, ?), (?, ?)'))
-        self.assertEqual(params, ['foo', True, 'bar', False, 'baz', False])
-
-    def test_insert_query(self):
-        Employee = Table('employee')
-        query = User.insert(
-            Employee.select(Employee.c.name, SQL('0')),
-            columns=[User.username, User.is_admin])
-        sql, params = __sql__(query)
-        self.assertEqual(sql, ('INSERT INTO "users" ("username", "is_admin") '
-                               'SELECT "employee"."name", 0 FROM "employee"'))
-
-    def test_update(self):
-        Stat = Table('stat', ('id', 'key', 'counter'))
-        query = (Stat
-                 .update(O(
-                     (Stat.key, 'k1'),
-                     (Stat.counter, Stat.counter + 1)))
-                 .where(Stat.key == 'k2'))
-        sql, params = __sql__(query)
-        self.assertEqual(sql, (
-            'UPDATE "stat" SET '
-            '"key" = ?, '
-            '"counter" = ("counter" + ?) '
-            'WHERE ("key" = ?)'))
-        self.assertEqual(params, ['k1', 1, 'k2'])
-
-    def test_update_subquery(self):
-        subquery = (User
-                    .select(User.id, fn.COUNT(Tweet.id).alias('ct'))
-                    .join(Tweet, on=(Tweet.user_id == User.id))
-                    .group_by(User.id)
-                    .having(SQL('ct') > 100))
-        query = (User
-                 .update({User.is_admin: True})
-                 .where(User.id << subquery))
-        sql, params = __sql__(query)
-        self.assertEqual(sql, (
-            'UPDATE "users" SET '
-            '"is_admin" = ? '
-            'WHERE ("id" IN ('
-            'SELECT "users"."id", COUNT("tweet"."id") AS "ct" '
-            'FROM "users" '
-            'INNER JOIN "tweet" '
-            'ON ("tweet"."user_id" = "users"."id") '
-            'GROUP BY "users"."id" '
-            'HAVING (ct > ?)))'))
-        self.assertEqual(params, [True, 100])
-
-    def test_delete_query(self):
-        query = (User
-                 .delete()
-                 .where(User.username != 'charlie')
-                 .limit(3))
-        sql, params = __sql__(query)
-        self.assertEqual(sql, (
-            'DELETE FROM "users" WHERE ("username" != ?) LIMIT 3'))
-        self.assertEqual(params, ['charlie'])
-
-    def test_delete_subquery(self):
-        subquery = (User
-                    .select(User.id, fn.COUNT(Tweet.id).alias('ct'))
-                    .join(Tweet, on=(Tweet.user_id == User.id))
-                    .group_by(User.id)
-                    .having(SQL('ct') > 100))
-        query = (User
-                 .delete()
-                 .where(User.id << subquery))
-        sql, params = __sql__(query)
-        self.assertEqual(sql, (
-            'DELETE FROM "users" '
-            'WHERE ("id" IN ('
-            'SELECT "users"."id", COUNT("tweet"."id") AS "ct" '
-            'FROM "users" '
-            'INNER JOIN "tweet" ON ("tweet"."user_id" = "users"."id") '
-            'GROUP BY "users"."id" '
-            'HAVING (ct > ?)))'))
-        self.assertEqual(params, [100])
 
 
 database = Database(':memory:')
 
-Person = Table('person', ('id', 'name'))
-Note = Table('notes', ('id', 'person_id', 'content', 'timestamp'))
+Account = Table('account', ('id', 'name'))
+Message = Table('message', ('id', 'account_id', 'content', 'timestamp'))
 
 
 class TestQueryExecution(BaseTestCase):
-    person_tbl = ('CREATE TABLE "person" (id INTEGER NOT NULL PRIMARY KEY, '
-                  'name TEXT NOT NULL)')
-    notes_tbl = ('CREATE TABLE "notes" (id INTEGER NOT NULL PRIMARY KEY, '
-                 'person_id INTEGER NOT NULL REFERENCES person(id), '
-                 'content TEXT NOT NULL, timestamp DATETIME NOT NULL)')
-
+    account_tbl = ('CREATE TABLE "account" (id INTEGER NOT NULL PRIMARY KEY, '
+                   'name TEXT NOT NULL)')
+    message_tbl = ('CREATE TABLE "message" (id INTEGER NOT NULL PRIMARY KEY, '
+                   'account_id INTEGER NOT NULL REFERENCES account(id), '
+                   'content TEXT NOT NULL, timestamp DATETIME NOT NULL)')
 
     def setUp(self):
         super(TestQueryExecution, self).setUp()
         database.connect()
 
-        database.execute_sql(self.person_tbl)
-        database.execute_sql(self.notes_tbl)
+        database.execute_sql(self.account_tbl)
+        database.execute_sql(self.message_tbl)
 
     def tearDown(self):
         database.close()
         super(TestQueryExecution, self).tearDown()
 
     def test_integration(self):
-        iq = Person.insert((
-            {Person.name: 'charlie'},
-            {Person.name: 'huey'},
-            {Person.name: 'mickey'},
-            {Person.name: 'zaizee'}))
+        iq = Account.insert((
+            {Account.name: 'charlie'},
+            {Account.name: 'huey'},
+            {Account.name: 'mickey'},
+            {Account.name: 'zaizee'}))
         last_row_id = iq.execute(database)
         self.assertEqual(last_row_id, 4)
 
         dt = datetime.datetime.now()
-        iq = Note.insert({
-            Note.person_id: 2,
-            Note.content: 'meow',
-            Note.timestamp: dt})
+        iq = Message.insert({
+            Message.account_id: 2,
+            Message.content: 'meow',
+            Message.timestamp: dt})
         self.assertEqual(iq.execute(database), 1)
 
-        q = (Person
-             .select(Person.name, Note.content, Note.timestamp)
-             .join(Note, on=(Person.id == Note.person_id))
-             .order_by(Note.timestamp))
+        q = (Account
+             .select(Account.name, Message.content, Message.timestamp)
+             .join(Message, on=(Account.id == Message.account_id))
+             .order_by(Message.timestamp))
         rows = q.execute(database)
         self.assertEqual([tuple(r) for r in rows], [
             ('huey', 'meow', dt)])
 
         D = lambda day: datetime.datetime(2017, 1, day)
         data = (
-            {Note.person_id: 2, Note.content: 'hiss', Note.timestamp: D(1)},
-            {Note.person_id: 3, Note.content: 'woof', Note.timestamp: D(2)},
-            {Note.person_id: 2, Note.content: 'purr', Note.timestamp: D(3)})
-        Note.insert(data).execute(database)
+            {Message.account_id: 2, Message.content: 'hiss', Message.timestamp: D(1)},
+            {Message.account_id: 3, Message.content: 'woof', Message.timestamp: D(2)},
+            {Message.account_id: 2, Message.content: 'purr', Message.timestamp: D(3)})
+        Message.insert(data).execute(database)
 
-        curs = (Note
-                .select(Person.name, Note.content)
-                .join(Person, on=(Note.person_id == Person.id))
-                .order_by(-Note.timestamp)
+        curs = (Message
+                .select(Account.name, Message.content)
+                .join(Account, on=(Message.account_id == Account.id))
+                .order_by(-Message.timestamp)
                 .limit(3)
                 .namedtuples()
                 .execute(database))
@@ -1237,19 +1013,19 @@ class TestQueryExecution(BaseTestCase):
             ('huey', 'purr')])
 
     def _create_people(self):
-        Person.insert((
-            {Person.name: 'charlie'},
-            {Person.name: 'huey'},
-            {Person.name: 'mickey'},
-            {Person.name: 'zaizee'})).execute(database)
+        Account.insert((
+            {Account.name: 'charlie'},
+            {Account.name: 'huey'},
+            {Account.name: 'mickey'},
+            {Account.name: 'zaizee'})).execute(database)
 
     def test_cursor_wrappers(self):
         self._create_people()
-        query = (Person
+        query = (Account
                  .select(
-                     Person.name,
-                     fn.SUBSTR(fn.MD5(Person.name), 1, 6).alias('hash'))
-                 .order_by(Person.name))
+                     Account.name,
+                     fn.SUBSTR(fn.MD5(Account.name), 1, 6).alias('hash'))
+                 .order_by(Account.name))
 
         dicts = list(query.dicts().execute(database))
         self.assertEqual(dicts, [
@@ -1268,7 +1044,7 @@ class TestQueryExecution(BaseTestCase):
 
     def test_cursor_iteration(self):
         self._create_people()
-        query = Person.select(Person.name).order_by(Person.name)
+        query = Account.select(Account.name).order_by(Account.name)
         cw = query.execute(database)
         rows = [r for r in cw]
 
@@ -1282,25 +1058,24 @@ class TestQueryExecution(BaseTestCase):
 
     def test_builtin_functions(self):
         self._create_people()
-        query = (Person
-                 .select(Person.name, fn.MD5(Person.name).alias('md5'))
-                 .order_by(Person.name))
+        query = (Account
+                 .select(Account.name, fn.MD5(Account.name).alias('md5'))
+                 .order_by(Account.name))
         self.assertEqual([tuple(row) for row in query.execute(database)], [
             ('charlie', 'bf779e0933a882808585d19455cd7937'),
             ('huey', 'ef63073058e004fb5e7f2b1f081c416f'),
             ('mickey', '4d5257e5acc7fcac2f5dcd66c4e78f9a'),
             ('zaizee', '7670f7740a587d5eaa3f56196c3b36ed')])
 
-        curs = (Person
-                .select(Person.name)
-                .where(fn.REGEXP(Person.name, '^.+ey$'))
-                .order_by(Person.name)
+        curs = (Account
+                .select(Account.name)
+                .where(fn.REGEXP(Account.name, '^.+ey$'))
+                .order_by(Account.name)
                 .namedtuples()
                 .execute(database))
         self.assertEqual([row.name for row in curs],
                          ['huey', 'mickey'])
 
-"""
 
 if __name__ == '__main__':
     unittest.main(argv=sys.argv)
