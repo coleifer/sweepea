@@ -20,6 +20,7 @@ import sqlite3 as pysqlite
 import struct
 import threading
 import uuid
+import zlib
 from sqlite3 import DatabaseError
 from sqlite3 import InterfaceError
 from sqlite3 import OperationalError
@@ -857,6 +858,39 @@ cdef class median(object):
             return self.selectKth(self.ct / 2)
 
 
+class DateSeries(TableFunction):
+    params = ['start', 'stop', 'step_seconds']
+    columns = ['date']
+    name = 'date_series'
+
+    def initialize(self, start, stop, step_seconds=86400):
+        self.start = format_date_time_sqlite(start)
+        self.stop = format_date_time_sqlite(stop)
+        step_seconds = int(step_seconds)
+        self.step_seconds = datetime.timedelta(seconds=step_seconds)
+
+        if self.is_zero_time(self.start) and step_seconds >= 86400:
+            self.format = '%Y-%m-%d'
+        elif self.is_zero_date(self.start) and self.is_zero_date(self.stop) \
+                and step_seconds < 86400:
+            self.format = '%H:%M:%S'
+        else:
+            self.format = '%Y-%m-%d %H:%M:%S'
+
+    def is_zero_time(self, dt):
+        return dt.hour == dt.minute == dt.second == 0
+
+    def is_zero_date(self, dt):
+        return (dt.year, dt.month, dt.day) == (1900, 1, 1)
+
+    def iterate(self, idx):
+        if self.start > self.stop:
+            raise StopIteration
+        current = self.start
+        self.start += self.step_seconds
+        return (current.strftime(self.format),)
+
+
 cdef int _aggressive_busy_handler(void *ptr, int n):
     # In concurrent environments, it often seems that if multiple queries are
     # kicked off at around the same time, they proceed in lock-step to check
@@ -1281,6 +1315,8 @@ cdef class Database(object):
             self.func('md5')(hash_md5)
             self.func('sha1')(hash_sha1)
             self.func('sha256')(hash_sha256)
+            self.func('adler32')(zlib.adler32)
+            self.func('crc32')(zlib.crc32)
 
     def init(self, database, **connect_kwargs):
         """Initialize the database with a new name and connection params."""
