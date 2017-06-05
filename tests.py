@@ -322,31 +322,31 @@ class TestHelpers(BaseTestCase):
 
     def test_changes_rowid(self):
         self.execute('create table register (value)')
-        self.assertEqual(self._db.rowcount, 0)
+        self.assertEqual(self._db.changes(), 0)
 
         self.execute('insert into register (value) values (?), (?)', 'a', 'b')
-        self.assertEqual(self._db.rowcount, 2)
-        self.assertEqual(self._db.last_insert_id, 2)
+        self.assertEqual(self._db.changes(), 2)
+        self.assertEqual(self._db.last_insert_rowid(), 2)
 
         self._db.close()
         self._db.connect()
 
         self.execute('insert into register (value) values (?), (?)', 'c', 'd')
-        self.assertEqual(self._db.rowcount, 2)
-        self.assertEqual(self._db.last_insert_id, 4)
+        self.assertEqual(self._db.changes(), 2)
+        self.assertEqual(self._db.last_insert_rowid(), 4)
 
         self.execute('insert into register (value) values (?)', 'e')
-        self.assertEqual(self._db.rowcount, 1)
-        self.assertEqual(self._db.last_insert_id, 5)
+        self.assertEqual(self._db.changes(), 1)
+        self.assertEqual(self._db.last_insert_rowid(), 5)
 
         # Changes works with update queries.
         self.execute('update register set value=?', 'x')
-        self.assertEqual(self._db.rowcount, 5)
-        self.assertEqual(self._db.last_insert_id, 5)
+        self.assertEqual(self._db.changes(), 5)
+        self.assertEqual(self._db.last_insert_rowid(), 5)
 
         # Changes picks up rows deleted.
         self.execute('delete from register where rowid > ?', 2)
-        self.assertEqual(self._db.rowcount, 3)
+        self.assertEqual(self._db.changes(), 3)
 
     def test_aggregate(self):
         @self._db.aggregate()
@@ -533,6 +533,8 @@ class TestQueryBuilder(BaseTestCase):
                  .select(User.id, User.username, UA.is_admin)
                  .join(UA, on=(User.id == UA.id))
                  .order_by(UA.is_admin))
+        ctx = Context()
+        ctx.sql(query)
         sql, params = __sql__(query)
         self.assertEqual(sql, (
             'SELECT "users"."id", "users"."username", "alt"."is_admin" '
@@ -622,7 +624,7 @@ class TestQueryBuilder(BaseTestCase):
                  .where(
                      Order.region << top_regions.select(top_regions.c.region))
                  .group_by(Order.region, Order.product)
-                 .with_(regional_sales, top_regions))
+                 .with_cte(regional_sales, top_regions))
         sql, params = __sql__(query)
         self.assertEqual(sql, (
             'WITH "regional_sales" AS ('
@@ -797,12 +799,11 @@ class TestQueryExecution(BaseTestCase):
             ('huey', 'meow', dt)])
 
         D = lambda day: datetime.datetime(2017, 1, day)
-        (Note
-         .insert((
-             {Note.person_id: 2, Note.content: 'hiss', Note.timestamp: D(1)},
-             {Note.person_id: 3, Note.content: 'woof', Note.timestamp: D(2)},
-             {Note.person_id: 2, Note.content: 'purr', Note.timestamp: D(3)}))
-         .execute(database))
+        data = (
+            {Note.person_id: 2, Note.content: 'hiss', Note.timestamp: D(1)},
+            {Note.person_id: 3, Note.content: 'woof', Note.timestamp: D(2)},
+            {Note.person_id: 2, Note.content: 'purr', Note.timestamp: D(3)})
+        Note.insert(data).execute(database)
 
         curs = (Note
                 .select(Person.name, Note.content)
@@ -812,9 +813,9 @@ class TestQueryExecution(BaseTestCase):
                 .namedtuples()
                 .execute(database))
         self.assertEqual([tuple(r) for r in curs], [
-            ('huey', 'meow'),
-            ('huey', 'purr'),
-            ('mickey', 'woof')])
+            ('huey', 'hiss'),
+            ('mickey', 'woof'),
+            ('huey', 'purr')])
 
     def _create_people(self):
         Person.insert((

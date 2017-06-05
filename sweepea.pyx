@@ -10,6 +10,7 @@ from libc.string cimport memcpy, memset
 from collections import namedtuple
 from contextlib import contextmanager
 from functools import partial
+from random import randint
 import decimal
 import hashlib
 import itertools
@@ -44,6 +45,7 @@ cdef struct sqlite3_index_constraint_usage:
 cdef extern from "sqlite3.h":
     ctypedef struct sqlite3:
         int busyTimeout
+    ctypedef struct sqlite3_backup
     ctypedef struct sqlite3_context
     ctypedef struct sqlite3_value
     ctypedef long long sqlite3_int64
@@ -221,6 +223,22 @@ cdef extern from "sqlite3.h":
     # Misc.
     cdef int sqlite3_busy_handler(sqlite3 *db, int(*)(void *, int), void *)
     cdef int sqlite3_sleep(int ms)
+    cdef sqlite3_backup *sqlite3_backup_init(
+        sqlite3 *pDest,
+        const char *zDestName,
+        sqlite3 *pSource,
+        const char *zSourceName)
+
+    # Backup.
+    cdef int sqlite3_backup_step(sqlite3_backup *p, int nPage)
+    cdef int sqlite3_backup_finish(sqlite3_backup *p)
+    cdef int sqlite3_backup_remaining(sqlite3_backup *p)
+    cdef int sqlite3_backup_pagecount(sqlite3_backup *p)
+
+    # Error handling.
+    cdef int sqlite3_errcode(sqlite3 *db)
+    cdef int sqlite3_errstr(int)
+    cdef const char *sqlite3_errmsg(sqlite3 *db)
 
 
 cdef extern from "_pysqlite/connection.h":
@@ -788,6 +806,57 @@ hash_sha1 = make_hash(hashlib.sha1)
 hash_sha256 = make_hash(hashlib.sha256)
 
 
+cdef class median(object):
+    cdef:
+        int ct
+        list items
+
+    def __init__(self):
+        self.ct = 0
+        self.items = []
+
+    cdef selectKth(self, int k, int s=0, int e=-1):
+        cdef:
+            int idx
+        if e < 0:
+            e = len(self.items)
+        idx = randint(s, e-1)
+        idx = self.partition_k(idx, s, e)
+        if idx > k:
+            return self.selectKth(k, s, idx)
+        elif idx < k:
+            return self.selectKth(k, idx + 1, e)
+        else:
+            return self.items[idx]
+
+    cdef int partition_k(self, int pi, int s, int e):
+        cdef:
+            int i, x
+
+        val = self.items[pi]
+        # Swap pivot w/last item.
+        self.items[e - 1], self.items[pi] = self.items[pi], self.items[e - 1]
+        x = s
+        for i in range(s, e):
+            if self.items[i] < val:
+                self.items[i], self.items[x] = self.items[x], self.items[i]
+                x += 1
+        self.items[x], self.items[e-1] = self.items[e-1], self.items[x]
+        return x
+
+    def step(self, item):
+        self.items.append(item)
+        self.ct += 1
+
+    def finalize(self):
+        if self.ct == 0:
+            return None
+        elif self.ct < 3:
+            return self.items[0]
+        else:
+            return self.selectKth(self.ct / 2)
+
+
 cdef int _aggressive_busy_handler(void *ptr, int n):
     # In concurrent environments, it often seems that if multiple queries are
     # kicked off at around the same time, they proceed in lock-step to check
@@ -821,22 +890,22 @@ cdef class CursorWrapper(object)  # Forward declaration.
 
 cdef class ResultIterator(object):
     cdef:
-        bint is_populated
-        int index
         CursorWrapper cursor_wrapper
+        int index
 
-    def __init__(self, CursorWrapper cursor_wrapper):
+    def __init__(self, cursor_wrapper):
         self.cursor_wrapper = cursor_wrapper
         self.index = 0
 
+    def __iter__(self):
+        return self
+
     def __next__(self):
-        cdef CursorWrapper cw = self.cursor_wrapper
-        if self.index < cw.count:
-            obj = cw.result_cache[self.index]
-        elif not cw.is_populated:
-            obj = cw.iterate()
-            cw.result_cache.append(obj)
-            cw.count += 1
+        if self.index < self.cursor_wrapper.count:
+            obj = self.cursor_wrapper.result_cache[self.index]
+        elif not self.cursor_wrapper.is_populated:
+            self.cursor_wrapper.iterate()
+            obj = self.cursor_wrapper.result_cache[self.index]
         else:
             raise StopIteration
         self.index += 1
@@ -846,12 +915,13 @@ cdef class ResultIterator(object):
 cdef class CursorWrapper(object):
     cdef:
         bint is_initialized, is_populated
-        int count, index
+        int count
         list columns, result_cache
         object cursor
 
     def __init__(self, cursor):
         self.cursor = cursor
+        self.count = 0
         self.is_initialized = False
         self.is_populated = False
         self.result_cache = []
@@ -861,26 +931,45 @@ cdef class CursorWrapper(object):
             return iter(self.result_cache)
         return ResultIterator(self)
 
+    def __getitem__(self, item):
+        if isinstance(item, slice):
+            stop = item.stop
+            if stop is None or stop < 0:
+                self.fill_cache()
+            else:
+                self.fill_cache(stop)
+            return self.result_cache[item]
+        elif isinstance(item, int):
+            self.fill_cache(item if item > 0 else 0)
+            return self.result_cache[item]
+        else:
+            raise ValueError('CursorWrapper only supports integer and slice '
+                             'indexes.')
+
     def __len__(self):
         self.fill_cache()
         return self.count
 
     cdef initialize(self):
         self.columns = [col[0] for col in self.cursor.description]
-        self.count = self.index = 0
-        self.is_initialized = True
 
-    cdef iterate(self):
+    def iterate(self, cache=True):
         cdef:
             tuple row = self.cursor.fetchone()
 
-        if not row:
+        if row is None:
             self.is_populated = True
+            self.cursor.close()
             raise StopIteration
         elif not self.is_initialized:
-            self.initialize()
+            self.initialize()  # Lazy initialization.
+            self.is_initialized = True
 
-        return self.transform(row)
+        self.count += 1
+        result = self.transform(row)
+        if cache:
+            self.result_cache.append(result)
+        return result
 
     cdef transform(self, tuple row):
         return row
@@ -889,46 +978,17 @@ cdef class CursorWrapper(object):
         while True:
             yield self.iterate()
 
-    def __next__(self):
-        cdef object inst
-
-        if self.index < self.count:
-            inst = self.result_cache[self.index]
-            self.index += 1
-            return inst
-        elif self.is_populated:
-            raise StopIteration
-
-        inst = self.iterate()
-        self.result_cache.append(inst)
-        self.count += 1
-        self.index += 1
-        return inst
-
     cpdef fill_cache(self, n=None):
         cdef:
             int counter = -1 if n is None else <int>n
-        if counter > 0:
-            counter = counter - self.count
 
-        self.index = self.count
-        while not self.is_populated and counter:
+        iterator = ResultIterator(self)
+        iterator.index = self.count
+        while not self.is_populated and (counter < 0 or counter > self.count):
             try:
-                next(self)
+                iterator.next()
             except StopIteration:
                 break
-            else:
-                counter -= 1
-
-    def __getitem__(self, value):
-        if isinstance(value, slice):
-            index = value.stop
-        else:
-            index = value
-        if index is not None:
-            index = index + 1 if index >= 0 else None
-        self.fill_cache(index)
-        return self.result_cache[value]
 
 
 cdef class DictCursorWrapper(CursorWrapper):
@@ -1213,6 +1273,7 @@ cdef class Database(object):
         if rank_functions:
             self.func('rank')(rank)
             self.func('bm25')(bm25)
+            self.aggregate('median')(median)
         if regex_function:
             self.func('regexp')(regexp)
         if hash_functions:
@@ -1259,12 +1320,14 @@ cdef class Database(object):
                 raise InterfaceError('Database has not been initialized.')
             if not self._local.closed:
                 raise InterfaceError('Connection already open in this thread.')
-            conn = self._local.conn = pysqlite.connect(self.database,
-                                                       **self.connect_kwargs)
+            self._local.conn = conn = self._connect()
             self._local.closed = False
             self.initialize_connection(conn)
 
         return True
+
+    cpdef _connect(self):
+        return pysqlite.connect(self.database, **self.connect_kwargs)
 
     cpdef bint close(self):
         """
@@ -1277,11 +1340,14 @@ cdef class Database(object):
             if self.deferred:
                 raise InterfaceError('Database has not been initialized.')
             if not self._local.closed:
-                self._local.conn.close()
+                self._close(self._local.conn)
                 self._local.closed = True
                 self._local.transactions = []
                 return True
             return False
+
+    cpdef _close(self, conn):
+        conn.close()
 
     def initialize_connection(self, conn):
         """
@@ -1340,10 +1406,10 @@ cdef class Database(object):
                     return avg(self.vals)
         """
         def decorator(klass):
-            aggregate_name = name or klass.__name__
-            self._aggregates[aggregate_name] = klass
+            agg_name = name or klass.__name__
+            self._aggregates[agg_name] = klass
             if not self.is_closed():
-                self._create_aggregate(self.get_conn(), klass, aggregate_name)
+                self._create_aggregate(self.connection(), klass, agg_name)
             return klass
         return decorator
 
@@ -1369,7 +1435,7 @@ cdef class Database(object):
             collation_name = name or fn.__name__
             self._collations[collation_name] = fn
             if not self.is_closed():
-                self._create_collation(self.get_conn(), fn, collation_name)
+                self._create_collation(self.connection(), fn, collation_name)
         return decorator
 
     cdef _create_function(self, conn, fn, name, nparams, deterministic):
@@ -1410,7 +1476,7 @@ cdef class Database(object):
             fn_name = name or fn.__name__
             self._functions[fn_name] = (fn, n, deterministic)
             if not self.is_closed():
-                self._create_function(self.get_conn(), fn, fn_name, n,
+                self._create_function(self.connection(), fn, fn_name, n,
                                       deterministic)
             return fn
         return decorator
@@ -1440,7 +1506,7 @@ cdef class Database(object):
                 klass.name = name
             self._table_functions.append(klass)
             if not self.is_closed():
-                klass.register(self.get_conn())
+                klass.register(self.connection())
             return klass
         return decorator
 
@@ -1459,7 +1525,7 @@ cdef class Database(object):
         """
         self._commit_hook = fn
         if not self.is_closed():
-            self._set_commit_hook(self.get_conn(), fn)
+            self._set_commit_hook(self.connection(), fn)
         return fn
 
     def _set_commit_hook(self, connection, fn):
@@ -1475,7 +1541,7 @@ cdef class Database(object):
         """
         self._rollback_hook = fn
         if not self.is_closed():
-            self._set_rollback_hook(self.get_conn(), fn)
+            self._set_rollback_hook(self.connection(), fn)
         return fn
 
     def _set_rollback_hook(self, connection, fn):
@@ -1506,7 +1572,7 @@ cdef class Database(object):
         """
         self._update_hook = fn
         if not self.is_closed():
-            self._set_update_hook(self.get_conn(), fn)
+            self._set_update_hook(self.connection(), fn)
         return fn
 
     def _set_update_hook(self, connection, fn):
@@ -1520,7 +1586,7 @@ cdef class Database(object):
         """Return a boolean indicating whether the DB is closed."""
         return self._local.closed
 
-    cdef get_conn(self):
+    cdef connection(self):
         # Internal method for quickly getting (or opening) a connection.
         if self._local.closed:
             self.connect()
@@ -1540,10 +1606,6 @@ cdef class Database(object):
         """Execute a the SQL query represented by a Query instance."""
         sql, params = Context().parse(query)
         return self.execute_sql(sql, params, query.commit)
-
-    cpdef sql(self, query):
-        """Compile a Query object into it's SQL and parameters."""
-        return Context().parse(query)
 
     def pragma(self, key, value=__sentinel__):
         """
@@ -1586,7 +1648,7 @@ cdef class Database(object):
         return Table(name)
 
     def __enter__(self):
-        self.connect()
+        self.connection()
         self.begin()
         return self
 
@@ -1602,28 +1664,13 @@ cdef class Database(object):
                 pass
         else:
             self.commit()
-        if not self._local.closed:
-            self.close()
+        self.close()
 
-    cdef _push_transaction(self, txn):
-        self._local.transactions.append(txn)
-
-    cdef _pop_transaction(self):
-        self._local.transactions.pop()
-
-    cdef _transaction_depth(self):
-        return len(self._local.transactions)
-
-    cdef last_insert_rowid(self):
+    cpdef last_insert_rowid(self):
         cdef:
             pysqlite_Connection *c = <pysqlite_Connection *>(self._local.conn)
         _check_connection(c)
         return <int>sqlite3_last_insert_rowid(c.db)
-
-    @property
-    def last_insert_id(self):
-        """Return the rowid of the most-recently-inserted row."""
-        return self.last_insert_rowid()
 
     @property
     def autocommit(self):
@@ -1632,17 +1679,10 @@ cdef class Database(object):
         _check_connection(c)
         return bool(sqlite3_get_autocommit(c.db))
 
-    cdef changes(self):
+    cpdef changes(self):
         cdef pysqlite_Connection *c = <pysqlite_Connection *>(self._local.conn)
         _check_connection(c)
         return sqlite3_changes(c.db)
-
-    @property
-    def rowcount(self):
-        """
-        Return the number of rows changed by the most-recently executed query.
-        """
-        return self.changes()
 
     def set_busy_handler(self, timeout=5000):
         """
@@ -1656,6 +1696,22 @@ cdef class Database(object):
 
         sqlite3_busy_handler(db, _aggressive_busy_handler, <void *>n)
         return True
+
+    cdef push_transaction(self, txn):
+        self._local.transactions.append(txn)
+
+    cdef pop_transaction(self):
+        self._local.transactions.pop()
+
+    cdef transaction_depth(self):
+        return len(self._local.transactions)
+
+    cdef top_transaction(self):
+        if self._local.transactions:
+            return self._local.transactions[-1]
+
+    cpdef _manual manual_commit(self):
+        return _manual(self)
 
     cpdef _atomic atomic(self):
         """
@@ -1788,6 +1844,12 @@ cdef class Database(object):
         cursor = self.execute_sql('PRAGMA foreign_key_list("%s")' % table)
         return [(row[3], row[2], row[4]) for row in cursor.fetchall()]
 
+    def backup(self, Database destination):
+        return backup(self.connection(), destination.connection())
+
+    def backup_to_file(self, filename):
+        return backup_to_file(self.connection(), filename)
+
     # Pragma queries.
     cache_size = __pragma__('cache_size')
     foreign_keys = __pragma__('foreign_keys')
@@ -1826,6 +1888,26 @@ cdef class Database(object):
     cache_write = __dbstatus__(SQLITE_DBSTATUS_CACHE_WRITE, False, True)
 
 
+cdef class _manual(_callable_context_manager):
+    cdef:
+        Database db
+
+    def __init__(self, Database db):
+        self.db = db
+
+    def __enter__(self):
+        top = self.db.top_transaction()
+        if top and not isinstance(self.db.top_transaction(), _manual):
+            raise ValueError('Cannot enter manual commit block while a '
+                             'transaction is active.')
+        self.db.push_transaction(self)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.db.pop_transaction() is not self:
+            raise ValueError('Transaction stack corrupted while exiting '
+                             'manual commit block.')
+
+
 cdef class _atomic(_callable_context_manager):
     cdef:
         Database db
@@ -1835,10 +1917,13 @@ cdef class _atomic(_callable_context_manager):
         self.db = db
 
     def __enter__(self):
-        if self.db._transaction_depth() == 0:
+        if self.db.transaction_depth() == 0:
             self._helper = self.db.transaction()
         else:
             self._helper = self.db.savepoint()
+            if isinstance(self.db.top_transaction(), _manual):
+                raise ValueError('Cannot enter atomic commit block while in '
+                                 'manual commit mode.')
         return self._helper.__enter__()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -1869,23 +1954,23 @@ cdef class _transaction(_callable_context_manager):
             self._begin()
 
     def __enter__(self):
-        if self.db._transaction_depth() == 0:
+        if self.db.transaction_depth() == 0:
             self._begin()
-        self.db._push_transaction(self)
+        self.db.push_transaction(self)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
             if exc_type:
                 self.rollback(False)
-            elif self.db._transaction_depth() == 1:
+            elif self.db.transaction_depth() == 1:
                 try:
                     self.commit(False)
                 except:
                     self.rollback(False)
                     raise
         finally:
-            self.db._pop_transaction()
+            self.db.pop_transaction()
 
 
 cdef class _savepoint(_callable_context_manager):
@@ -1901,14 +1986,18 @@ cdef class _savepoint(_callable_context_manager):
     cpdef _execute(self, basestring query):
         self.db.execute_sql(query)
 
-    cpdef commit(self):
+    cpdef _begin(self):
+        self._execute('SAVEPOINT %s;' % self.quoted_sid)
+
+    cpdef commit(self, begin=True):
         self._execute('RELEASE SAVEPOINT %s;' % self.quoted_sid)
+        if begin: self._begin()
 
     cpdef rollback(self):
         self._execute('ROLLBACK TO SAVEPOINT %s;' % self.quoted_sid)
 
     def __enter__(self):
-        self._execute('SAVEPOINT %s;' % self.quoted_sid)
+        self._begin()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -1916,7 +2005,7 @@ cdef class _savepoint(_callable_context_manager):
             self.rollback()
         else:
             try:
-                self.commit()
+                self.commit(begin=False)
             except:
                 self.rollback()
                 raise
@@ -1927,6 +2016,7 @@ SCOPE_NORMAL = 0
 SCOPE_SOURCE = 1
 SCOPE_VALUES = 2
 SCOPE_CTE = 3
+SCOPE_COLUMN = 4
 
 
 cdef class State(object):
@@ -1965,8 +2055,6 @@ cdef class Context(object):
     correctly.
     """
     cdef:
-        public parentheses, subquery
-        public int scope
         public list stack, _sql, _values
         public State state
 
@@ -1975,12 +2063,18 @@ cdef class Context(object):
         self._sql = []
         self._values = []
         self.state = State()
-        self.refresh()
 
-    cdef refresh(self):
-        self.scope = self.state.scope
-        self.parentheses = self.state.parentheses
-        self.subquery = self.state.subquery
+    @property
+    def scope(self):
+        return self.state.scope
+
+    @property
+    def parentheses(self):
+        return self.state.parentheses
+
+    @property
+    def subquery(self):
+        return self.state.subquery
 
     def __call__(self, **overrides):
         if overrides and overrides.get('scope') == self.scope:
@@ -1988,13 +2082,13 @@ cdef class Context(object):
 
         self.stack.append(self.state)
         self.state = self.state(**overrides)
-        self.refresh()
         return self
 
     scope_normal = __scope_context__(SCOPE_NORMAL)
     scope_source = __scope_context__(SCOPE_SOURCE)
     scope_values = __scope_context__(SCOPE_VALUES)
     scope_cte = __scope_context__(SCOPE_CTE)
+    scope_column = __scope_context__(SCOPE_COLUMN)
 
     def __enter__(self):
         if self.parentheses:
@@ -2005,7 +2099,6 @@ cdef class Context(object):
         if self.parentheses:
             self.literal(')')
         self.state = self.stack.pop()
-        self.refresh()
 
     cpdef Context sql(self, obj):
         if isinstance(obj, (Node, Context)):
@@ -2018,7 +2111,7 @@ cdef class Context(object):
         self._sql.append(sql)
         return self
 
-    cdef Context bind_value(self, value):
+    cdef Context value(self, value):
         self._values.append(value)
         return self
 
@@ -2027,9 +2120,8 @@ cdef class Context(object):
         ctx._values.extend(self._values)
         return ctx
 
-    cpdef tuple parse(self, query):
-        self.sql(query)
-        return ''.join(self._sql), self._values
+    cpdef tuple parse(self, node):
+        return self.sql(node).query()
 
     cpdef tuple query(self):
         return ''.join(self._sql), self._values
@@ -2082,6 +2174,9 @@ class Node(object):
         obj.__dict__ = self.__dict__.copy()
         return obj
 
+    def __sql__(self, ctx):
+        raise NotImplementedError
+
     @staticmethod
     def copy(method):
         def inner(self, *args, **kwargs):
@@ -2090,6 +2185,9 @@ class Node(object):
             return clone
         return inner
 
+    def unwrap(self):
+        return self
+
 
 class Source(Node):
     c = _DynamicColumn()
@@ -2097,10 +2195,11 @@ class Source(Node):
     def __init__(self, alias=None):
         super(Source, self).__init__()
         self._alias = alias
+        self._query_name = None
 
     @Node.copy
-    def alias(self, name=None):
-        self._alias = name
+    def alias(self, alias=None):
+        self._alias = alias
 
     def select(self, *selection):
         return Select((self,), selection)
@@ -2116,10 +2215,36 @@ class Source(Node):
             ctx.literal(' AS ').sql(Entity(self._alias))
         return ctx
 
+    def apply_column(self, ctx):
+        return ctx.sql(Entity(self._alias or self._query_name))
 
-class Table(Source):
+
+def __join__(join_type='INNER', inverted=False):
+    def method(self, other):
+        if inverted:
+            self, other = other, self
+        return Join(self, other, join_type=join_type)
+    return method
+
+
+class BaseTable(Source):
+    """
+    Base class for table-like objects, which support JOINs via operator
+    overloading.
+    """
+    __and__ = __join__('INNER')
+    __add__ = __join__('LEFT_OUTER')
+    __or__ = __join__('FULL_OUTER')
+    __mul__ = __join__('CROSS')
+    __rand__ = __join__('INNER', inverted=True)
+    __radd__ = __join__('LEFT_OUTER', inverted=True)
+    __ror__ = __join__('FULL_OUTER', inverted=True)
+    __rmul__ = __join__('CROSS', inverted=True)
+
+
+class Table(BaseTable):
     def __init__(self, name, columns=None, schema=None, alias=None):
-        self.name = name
+        self.name = self._query_name = name
         self._columns = columns
         self._schema = schema
         self._path = (self._schema, name) if self._schema else (name,)
@@ -2139,31 +2264,29 @@ class Table(Source):
             selection = [Column(self, column) for column in self._columns]
         return Select((self,), selection)
 
-    def insert(self, data, **kwargs):
+    def insert(self, data=None, **kwargs):
+        # TODO: normalize
         return Insert(self, data, **kwargs)
 
-    def update(self, data):
+    def update(self, data=None, **kwargs):
+        # TODO: normalize
         return Update(self, data)
 
     def delete(self):
         return Delete(self)
 
     def __sql__(self, Context ctx):
+        if not self._alias:
+            return ctx.sql(Entity(*self._path))
+
         if ctx.scope == SCOPE_SOURCE:
-            ctx.sql(Entity(*self._path))
-            if self._alias:
-                ctx.literal(' AS ')
-                ctx.sql(Entity(self._alias))
-        elif self._alias:
-            ctx.sql(Entity(self._alias))
-        else:
-            ctx.sql(Entity(*self._path))
-        return ctx
+            ctx.sql(Entity(*self._path)).literal(' AS ')
+        return ctx.sql(Entity(self._alias))
 
 
-class Join(Source):
-    def __init__(self, lhs, rhs, join_type='INNER', on=None):
-        super(Join, self).__init__()
+class Join(BaseTable):
+    def __init__(self, lhs, rhs, join_type='INNER', on=None, alias=None):
+        super(Join, self).__init__(alias=alias)
         self._lhs = lhs
         self._rhs = rhs
         self._join_type = join_type
@@ -2197,7 +2320,7 @@ class CTE(Source):
         ctx.sql(Entity(self._alias))
         if ctx.scope == SCOPE_CTE:
             if self._columns:
-                ctx.literal(' ').sql(EnclosedList(self._columns))
+                ctx.literal(' ').sql(EnclosedNodeList(self._columns))
             ctx.literal(' AS (')
             with ctx.scope_normal():
                 ctx.sql(self._query)
@@ -2205,19 +2328,26 @@ class CTE(Source):
         return ctx
 
 
-class EntityBase(Node):
+class ColumnBase(Node):
     def alias(self, name):
-        return Alias(self, name)
-    def __inv__(self):
+        if name:
+            return Alias(self, name)
+        return self
+
+    def unalias(self):
+        return self
+
+    def asc(self):
+        return Asc(self)
+    __pos__ = asc
+
+    def desc(self):
+        return Desc(self)
+    __neg__ = asc
+
+    def __invert__(self):
         return Negated(self)
-    def __eq__(self, other):
-        return Expression(self, '=', other)
-    def __ne__(self, other):
-        return Expression(self, '!=', other)
-    def __neg__(self):
-        return self.desc()
-    def __pos__(self):
-        return self.asc()
+
     def __e__(op, inv=False):
         def inner(self, rhs):
             if inv:
@@ -2226,6 +2356,7 @@ class EntityBase(Node):
         return inner
     __and__ = __e__('AND')
     __or__ = __e__('OR')
+
     __add__ = __e__('+')
     __sub__ = __e__('-')
     __mul__ = __e__('*')
@@ -2236,6 +2367,11 @@ class EntityBase(Node):
     __rsub__ = __e__('-', True)
     __rmul__ = __e__('*', True)
     __rdiv__ = __e__('/', True)
+
+    def __eq__(self, other):
+        return Expression(self, 'IS' if other is None else '=', other)
+    def __ne__(self, other):
+        return Expression(self, 'IS NOT' if other is None else '!=', other)
     __lt__ = __e__('<')
     __gt__ = __e__('>')
     __le__ = __e__('<=')
@@ -2246,39 +2382,28 @@ class EntityBase(Node):
     __pow__ = __e__('GLOB')
     in_ = __e__('IN')
     not_in = __e__('NOT IN')
+    bin_and = __e__('&')
+    bin_or = __e__('|')
     def is_null(self, is_null=True):
         return Expression(self, ('IS' if is_null else 'IS NOT'), None)
     def between(self, lo, hi):
         return Expression(self, 'BETWEEN', Expression(lo, 'AND', hi, True))
 
-    def asc(self):
-        return Asc(self)
-    def desc(self):
-        return Desc(self)
+    def contains(self, rhs):
+        return Expression(self, 'LIKE', '%%%s%%' % rhs)
+    def startswith(self, rhs):
+        return Expression(self, 'LIKE', '%s%%' % rhs)
+    def endswith(self, rhs):
+        return Expression(self, 'LIKE', '%%%s' % rhs)
+    def regexp(self, expression):
+        return Expression(self, 'REGEXP', expression)
+    def concat(self, rhs):
+        return StringExpression(self, '||', rhs)
 
 
-class Value(EntityBase):
-    def __init__(self, value):
-        self.value = value
-        self.multi = isinstance(self.value, (list, tuple))
-        if self.multi:
-            self.bind_values = []
-            for item in self.value:
-                if isinstance(item, Node):
-                    self.bind_values.append(item)
-                else:
-                    self.bind_values.append(Value(item))
-
-    def __sql__(self, Context ctx):
-        if self.multi:
-            return ctx.sql(EnclosedList(self.bind_values))
-        else:
-            return ctx.literal('?').bind_value(self.value)
-
-
-class Column(EntityBase):
-    def __init__(self, table, name):
-        self.table = table
+class Column(ColumnBase):
+    def __init__(self, source, name):
+        self.source = source
         self.name = name
 
     def __sql__(self, Context ctx):
@@ -2286,106 +2411,144 @@ class Column(EntityBase):
             return ctx.sql(Entity(self.name))
         else:
             with ctx.scope_normal():
-                return ctx.sql(self.table).literal('.').sql(Entity(self.name))
+                return ctx.sql(self.source).literal('.').sql(Entity(self.name))
 
 
-class Expression(EntityBase):
-    def __init__(self, lhs, op, rhs, is_flat=False):
-        if not isinstance(lhs, Node):
-            lhs = Value(lhs)
-        if not isinstance(rhs, Node):
-            rhs = Value(rhs)
+class WrappedNode(ColumnBase):
+    def __init__(self, node):
+        self.node = node
+
+    def unwrap(self):
+        return self.node.unwrap()
+
+
+class Alias(WrappedNode):
+    def __init__(self, node, alias):
+        super(Alias, self).__init__(node)
+        self._alias = alias
+
+    def alias(self, alias=None):
+        if alias is None:
+            return self.node
+        return Alias(self.node, alias)
+
+    def unalias(self):
+        return self.node
+
+    def __sql__(self, Context ctx):
+        return ctx.sql(self.node).literal(' AS ').sql(Entity(self._alias))
+
+
+class Negated(WrappedNode):
+    def __invert__(self):
+        return self.node
+
+    def __sql__(self, Context ctx):
+        return ctx.literal(' NOT ').sql(self.node)
+
+
+class Value(ColumnBase):
+    def __init__(self, value, unpack=True):
+        self.value = value
+        self.multi = isinstance(self.value, (list, tuple)) and unpack
+        if self.multi:
+            self.values = []
+            for item in self.value:
+                if isinstance(item, Node):
+                    self.values.append(item)
+                else:
+                    self.values.append(Value(item))
+
+    def __sql__(self, Context ctx):
+        if self.multi:
+            return ctx.sql(EnclosedNodeList(self.values))
+        else:
+            return ctx.literal('?').value(self.value)
+
+
+class Cast(WrappedNode):
+    def __init__(self, node, cast):
+        super(Cast, self).__init__(node)
+        self.cast = cast
+
+    def __sql__(self, Context ctx):
+        return (ctx
+                .literal('CAST(')
+                .sql(self.node)
+                .literal(' AS %s)' % self.cast))
+
+
+class Ordering(WrappedNode):
+    def __init__(self, node, direction, collation=None):
+        super(Ordering, self).__init__(node)
+        self.direction = direction
+        self.collation = collation
+
+    def collate(self, collation=None):
+        return Ordering(self.node, self.direction, collation)
+
+    def __sql__(self, Context ctx):
+        ctx.sql(self.node).literal(' %s' % self.direction)
+        if self.collation:
+            ctx.literal(' COLLATE %s' % self.collation)
+        return ctx
+
+
+def Asc(entity, collation=None):
+    return Ordering(entity, 'ASC', collation)
+
+
+def Desc(entity, collation=None):
+    return Ordering(entity, 'DESC', collation)
+
+
+class Expression(ColumnBase):
+    def __init__(self, lhs, op, rhs, flat=False):
         self.lhs = lhs
         self.op = op
         self.rhs = rhs
-        self._is_flat = is_flat
+        self.flat = flat
 
     def __sql__(self, Context ctx):
-        with ctx(parentheses=not self._is_flat):
+        with ctx(parentheses=not self.flat):
+            if self.op == 'IN' and not Context().sql(self.rhs).query()[0]:
+                return ctx.literal('0 = 1')
+
             return (ctx
                     .sql(self.lhs)
                     .literal(' %s ' % self.op)
                     .sql(self.rhs))
 
 
-class EntityWrapper(EntityBase):
-    def __init__(self, entity, *args, **kwargs):
-        self.entity = entity
-        super(EntityWrapper, self).__init__(*args, **kwargs)
+class StringExpression(Expression):
+    def __add__(self, rhs):
+        return self.concat(rhs)
+    def __radd__(self, lhs):
+        return StringExpression(lhs, '||', self)
 
 
-class Alias(EntityWrapper):
-    def __init__(self, entity, name):
-        super(Alias, self).__init__(entity)
-        self.name = name
+def quote(list path):
+    cdef:
+        int n = len(path)
+        str part
+        tuple quotes = ('"', '"')
 
-    def alias(self, name):
-        if not name:
-            return self.entity
-        self.name = name
-        return self
-
-    def __sql__(self, Context ctx):
-        return ctx.sql(self.entity).literal(' AS "%s"' % self.name)
+    if n == 1:
+        return path[0].join(quotes)
+    elif n > 1:
+        return '.'.join([part.join(quotes) for part in path])
+    return ''
 
 
-class Negated(EntityWrapper):
-    def __invert__(self):
-        return self.entity
-
-    def __sql__(self, Context ctx):
-        return ctx.literal(' NOT ').sql(self.entity)
-
-
-class Cast(EntityWrapper):
-    def __init__(self, entity, cast):
-        super(Cast, self).__init__(entity)
-        self.cast = cast
-
-    def __sql__(self, Context ctx):
-        return (ctx
-                .literal('CAST(')
-                .sql(self.entity)
-                .literal(' AS %s)' % self.cast))
-
-
-class Ordering(EntityWrapper):
-    def __init__(self, entity, direction, collation=None, nulls=None):
-        super(Ordering, self).__init__(entity)
-        self.direction = direction
-        self.collation = collation
-        self.nulls = nulls
-
-    def collate(self, collation=None):
-        return Ordering(self.entity, self.direction, collation, self.nulls)
-
-    def __sql__(self, Context ctx):
-        ctx.sql(self.entity).literal(' %s' % self.direction)
-        if self.collation:
-            ctx.literal(' COLLATE %s' % self.collation)
-        if self.nulls:
-            ctx.literal(' NULLS %s' % self.nulls)
-        return ctx
-
-
-def Asc(entity, collation=None, nulls=None):
-    return Ordering(entity, 'ASC', collation, nulls)
-
-
-def Desc(entity, collation=None, nulls=None):
-    return Ordering(entity, 'DESC', collation, nulls)
-
-
-class Entity(EntityBase):
+class Entity(ColumnBase):
     def __init__(self, *path):
-        self._path = filter(None, path)
-        self._quoted = '.'.join('"%s"' % part for part in self._path)
+        self._path = [part.replace('"', '""') for part in path if part]
 
     def __sql__(self, Context ctx):
-        return ctx.literal(self._quoted)
+        return ctx.literal(quote(self._path))
 
 
-class SQL(EntityBase):
+class SQL(ColumnBase):
     def __init__(self, sql, params=None):
         self.sql = sql
         self.params = params
@@ -2397,7 +2560,7 @@ class SQL(EntityBase):
                 if isinstance(param, Node):
                     ctx.sql(param)
                 else:
-                    ctx.bind_value(param)
+                    ctx.value(param)
         return ctx
 
 
@@ -2405,7 +2568,7 @@ def Check(constraint):
     return SQL('CHECK (%s)' % constraint)
 
 
-class Function(EntityBase):
+class Function(ColumnBase):
     def __init__(self, name, arguments):
         self.name = name
         self.arguments = arguments
@@ -2420,7 +2583,12 @@ class Function(EntityBase):
         if not len(self.arguments):
             ctx.literal('()')
         else:
-            ctx.sql(EnclosedList([
+            if len(self.arguments) == 1 and isinstance(self.arguments[0],
+                                                       SelectBase):
+                wrapper = CommaNodeList
+            else:
+                wrapper = EnclosedNodeList
+            ctx.sql(wrapper([
                 (arg if isinstance(arg, Node) else Value(arg))
                 for arg in self.arguments]))
         return ctx
@@ -2428,7 +2596,19 @@ class Function(EntityBase):
 fn = Function(None, None)
 
 
-class List(Node):
+def Case(predicate, expression_tuples, default=None):
+    clauses = [SQL('CASE')]
+    if predicate is not None:
+        clauses.append(predicate)
+    for expr, value in expression_tuples:
+        clauses.extend((SQL('WHEN'), expr, SQL('THEN'), value))
+    if default is not None:
+        clauses.extend((SQL('ELSE'), default))
+    clauses.append(SQL('END'))
+    return NodeList(clauses)
+
+
+class NodeList(Node):
     def __init__(self, nodes, glue=' ', parentheses=False):
         self.nodes = nodes
         self.glue = glue
@@ -2450,12 +2630,12 @@ class List(Node):
         return ctx
 
 
-def CommaList(nodes):
-    return List(nodes, ', ')
+def CommaNodeList(nodes):
+    return NodeList(nodes, ', ')
 
 
-def EnclosedList(nodes):
-    return List(nodes, ', ', True)
+def EnclosedNodeList(nodes):
+    return NodeList(nodes, ', ', True)
 
 
 class Query(Node):
@@ -2463,7 +2643,9 @@ class Query(Node):
 
     def __init__(self, order_by=None, limit=None, offset=None, **kwargs):
         super(Query, self).__init__(**kwargs)
-        self._order_by, self._limit, self._offset = order_by, limit, offset
+        self._order_by = order_by
+        self._limit = limit
+        self._offset = offset
         self._cte_list = None
         self._cursor = None
 
@@ -2473,7 +2655,7 @@ class Query(Node):
         return query
 
     @Node.copy
-    def with_(self, *cte_list):
+    def with_cte(self, *cte_list):
         self._cte_list = cte_list
 
     @Node.copy
@@ -2501,7 +2683,7 @@ class Query(Node):
 
     def apply_ordering(self, Context ctx):
         if self._order_by:
-            ctx.literal(' ORDER BY ').sql(CommaList(self._order_by))
+            ctx.literal(' ORDER BY ').sql(CommaNodeList(self._order_by))
         if self._limit is not None or self._offset is not None:
             ctx.literal(' LIMIT %d' % (self._limit or -1))
         if self._offset is not None:
@@ -2514,29 +2696,43 @@ class Query(Node):
             with ctx.scope_cte():
                 (ctx
                  .literal('WITH RECURSIVE ' if recursive else 'WITH ')
-                 .sql(CommaList(self._cte_list))
+                 .sql(CommaNodeList(self._cte_list))
                  .literal(' '))
         return ctx
 
     def execute(self, database):
         raise NotImplementedError
 
+    def sql(self):
+        return Context().parse(self)
+
+
+def __compound_select__(operation, inverted=False):
+    def method(self, other):
+        if inverted:
+            self, other = other, self
+        return CompoundSelect(self, operation, other)
+    return method
+
 
 class SelectBase(Source, Query):
     commit = False
+    __add__ = __compound_select__('UNION ALL')
+    __or__ = __compound_select__('UNION')
+    __and__ = __compound_select__('INTERSECT')
+    __sub__ = __compound_select__('EXCEPT')
+    __radd__ = __compound_select__('UNION ALL', inverted=True)
+    __ror__ = __compound_select__('UNION', inverted=True)
+    __rand__ = __compound_select__('INTERSECT', inverted=True)
+    __rsub__ = __compound_select__('EXCEPT', inverted=True)
 
     def __init__(self, *args, **kwargs):
         super(SelectBase, self).__init__(*args, **kwargs)
-        self._dicts = self._namedtuples = self._objects = False
+        self._dicts = False
+        self._namedtuples = False
+        self._objects = False
+        self._query_name = 'sq'
 
-    def __add__(self, rhs):
-        return CompoundSelect(self, 'UNION ALL', rhs)
-    def __or__(self, rhs):
-        return CompoundSelect(self, 'UNION', rhs)
-    def __and__(self, rhs):
-        return CompoundSelect(self, 'INTERSECT', rhs)
-    def __sub__(self, rhs):
-        return CompoundSelect(self, 'EXCEPT', rhs)
     def cte(self, name, recursive=False, columns=None):
         return CTE(name, self, recursive, columns)
 
@@ -2574,11 +2770,15 @@ class CompoundSelect(SelectBase):
         self.rhs = rhs
 
     def __sql__(self, Context ctx):
-        with ctx(parentheses=ctx.scope == SCOPE_SOURCE):
-            with ctx(parentheses=False):
+        if ctx.scope == SCOPE_COLUMN:
+            return self.apply_column(ctx)
+
+        outer_parens = ctx.subquery or (ctx.scope == SCOPE_SOURCE)
+        with ctx(parentheses=outer_parens):
+            with ctx.scope_normal(parentheses=False, subquery=False):
                 ctx.sql(self.lhs)
             ctx.literal(' %s ' % self.op)
-            with ctx(parentheses=False):
+            with ctx.scope_normal(parentheses=False, subquery=False):
                 ctx.sql(self.rhs)
         ctx = self.apply_ordering(ctx)
         return self.apply_alias(ctx)
@@ -2616,6 +2816,12 @@ class Select(SelectBase):
         item = self._from.pop()
         self._from.append(Join(item, dest, join_type, on))
 
+    def inner_join(self, dest, on=None):
+        return self.join(dest, 'INNER', on)
+
+    def left_outer_join(self, dest, on=None):
+        return self.join(dest, 'LEFT OUTER', on)
+
     @Node.copy
     def where(self, *expressions):
         if self._where is not None:
@@ -2642,22 +2848,25 @@ class Select(SelectBase):
 
     def __sql__(self, Context ctx):
         super(Select, self).__sql__(ctx)
+        if ctx.scope == SCOPE_COLUMN:
+            return self.apply_column(ctx)
+
         is_subquery = ctx.subquery
         parentheses = is_subquery or (ctx.scope == SCOPE_SOURCE)
         with ctx.scope_normal(parentheses=parentheses, subquery=True):
             ctx.literal('SELECT DISTINCT ' if self._distinct else 'SELECT ')
             with ctx.scope_source():
-                ctx.sql(CommaList(self._columns))
+                ctx.sql(CommaNodeList(self._columns))
 
             if self._from:
                 with ctx.scope_source(parentheses=False):
-                    ctx.literal(' FROM ').sql(CommaList(self._from))
+                    ctx.literal(' FROM ').sql(CommaNodeList(self._from))
 
             if self._where is not None:
                 ctx.literal(' WHERE ').sql(self._where)
 
             if self._group_by:
-                ctx.literal(' GROUP BY ').sql(CommaList(self._group_by))
+                ctx.literal(' GROUP BY ').sql(CommaNodeList(self._group_by))
 
             if self._having is not None:
                 ctx.literal(' HAVING ').sql(self._having)
@@ -2697,6 +2906,8 @@ class Update(WriteQuery):
         self._on_conflict = on_conflict
 
     def __sql__(self, Context ctx):
+        super(Update, self).__sql__(ctx)
+
         with ctx.scope_values(subquery=True):
             ctx.literal('UPDATE ')
             if self._on_conflict:
@@ -2705,8 +2916,8 @@ class Update(WriteQuery):
             (ctx
              .sql(self.table)
              .literal(' SET ')
-             .sql(CommaList([
-                 List((key, SQL('='), value))
+             .sql(CommaNodeList([
+                 NodeList((key, SQL('='), value))
                  for key, value in self.data.items()])))
 
             if self._where is not None:
@@ -2715,8 +2926,8 @@ class Update(WriteQuery):
             return self.apply_ordering(ctx)
 
     def execute(self, Database database):
-        database.execute(self)
-        return database.changes()
+        cursor = database.execute(self)
+        return cursor.rowcount
 
 
 class Insert(WriteQuery):
@@ -2738,9 +2949,9 @@ class Insert(WriteQuery):
                 value = Value(value)
             values.append(value)
         return (ctx
-                .sql(EnclosedList(columns))
+                .sql(EnclosedNodeList(columns))
                 .literal(' VALUES ')
-                .sql(EnclosedList(values)))
+                .sql(EnclosedNodeList(values)))
 
     def _multi_insert(self, Context ctx):
         rows_iter = iter(self.data)
@@ -2753,7 +2964,7 @@ class Insert(WriteQuery):
             columns = row.keys()
             rows_iter = itertools.chain(iter((row,)), rows_iter)
 
-        ctx.sql(EnclosedList(columns)).literal(' VALUES ')
+        ctx.sql(EnclosedNodeList(columns)).literal(' VALUES ')
         all_values = []
         for row in rows_iter:
             values = []
@@ -2763,13 +2974,13 @@ class Insert(WriteQuery):
                     value = Value(value)
                 values.append(value)
 
-            all_values.append(EnclosedList(values))
+            all_values.append(EnclosedNodeList(values))
 
-        return ctx.sql(CommaList(all_values))
+        return ctx.sql(CommaNodeList(all_values))
 
     def _query_insert(self, Context ctx):
         return (ctx
-                .sql(EnclosedList(self._columns))
+                .sql(EnclosedNodeList(self._columns))
                 .literal(' ')
                 .sql(self.data))
 
@@ -2789,8 +3000,8 @@ class Insert(WriteQuery):
         return ctx
 
     def execute(self, Database database):
-        database.execute(self)
-        return database.last_insert_rowid()
+        cursor = database.execute(self)
+        return cursor.lastrowid
 
 
 class Delete(WriteQuery):
@@ -2814,8 +3025,8 @@ class Delete(WriteQuery):
             return self.apply_ordering(ctx)
 
     def execute(self, Database database):
-        database.execute(self)
-        return database.changes()
+        cursor = database.execute(self)
+        return cursor.rowcount
 
 
 SQLITE_DATETIME_FORMATS = (
@@ -2836,12 +3047,14 @@ SQLITE_TIME_FORMATS = (
     '%Y-%m-%d %H:%M:%S',
     '%Y-%m-%d %H:%M:%S.%f')
 
+
 cpdef format_datetime(date_value):
     for date_format in SQLITE_DATETIME_FORMATS:
         try:
             return datetime.datetime.strptime(date_value, date_format)
         except ValueError:
             pass
+
 
 cpdef format_date(date_value):
     cdef datetime.datetime date_obj
@@ -2853,6 +3066,7 @@ cpdef format_date(date_value):
         else:
             return date_obj.date()
 
+
 cpdef format_time(time_value):
     cdef datetime.datetime date_obj
     for date_format in SQLITE_TIME_FORMATS:
@@ -2862,6 +3076,33 @@ cpdef format_time(time_value):
             pass
         else:
             return date_obj.time()
+
+
+def backup(src_conn, dest_conn):
+    cdef:
+        pysqlite_Connection *src = <pysqlite_Connection *>src_conn
+        pysqlite_Connection *dest = <pysqlite_Connection *>dest_conn
+        sqlite3 *src_db = src.db
+        sqlite3 *dest_db = dest.db
+        sqlite3_backup *backup
+
+    backup = sqlite3_backup_init(dest_db, 'main', src_db, 'main')
+    if (backup == NULL):
+        raise OperationalError('Unable to initialize backup.')
+
+    sqlite3_backup_step(backup, -1)
+    sqlite3_backup_finish(backup)
+    if sqlite3_errcode(dest_db):
+        raise OperationalError('Error finishing backup: %s' %
+                               sqlite3_errmsg(dest_db))
+    return True
+
+
+def backup_to_file(src_conn, filename):
+    dest_conn = pysqlite.connect(filename)
+    backup(src_conn, dest_conn)
+    dest_conn.close()
+    return True
 
 
 pysqlite.register_adapter(decimal.Decimal, str)
