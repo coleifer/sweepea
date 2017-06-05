@@ -75,7 +75,11 @@ class Split(TableFunction):
 
 
 class BaseTestCase(unittest.TestCase):
-    pass
+    def assertSQL(self, query, sql, params=None):
+        params = [] if params is None else params
+        qsql, qparams = Context().parse(query)
+        self.assertEqual(qsql, sql)
+        self.assertEqual(qparams, params)
 
 
 class TestTableFunction(BaseTestCase):
@@ -473,8 +477,12 @@ class TestHelpers(BaseTestCase):
         self.assertTrue(db.is_closed())
 
 
-User = Table('users', ('id', 'username', 'is_admin'))
-Tweet = Table('tweet', ('id', 'user_id', 'content', 'timestamp'))
+#User = Table('users', ('id', 'username', 'is_admin'))
+#Tweet = Table('tweet', ('id', 'user_id', 'content', 'timestamp'))
+User = Table('users')
+Tweet = Table('tweets')
+Person = Table('person', ['id', 'name', 'dob'])
+Note = Table('note', ['id', 'person_id', 'content'])
 
 def __sql__(query):
     return Context().parse(query)
@@ -482,9 +490,420 @@ def __sql__(query):
 
 class TestQueryBuilder(BaseTestCase):
     def test_select(self):
+        query = (User
+                 .select(User.c.id, User.c.username)
+                 .where(User.c.username == 'foo'))
+        self.assertSQL(query, (
+            'SELECT "users"."id", "users"."username" '
+            'FROM "users" '
+            'WHERE ("users"."username" = ?)'), ['foo'])
+
+    def test_select_explicit_columns(self):
+        query = (Person
+                 .select()
+                 .where(Person.dob < datetime.date(1980, 1, 1)))
+        self.assertSQL(query, (
+            'SELECT "person"."id", "person"."name", "person"."dob" '
+            'FROM "person" '
+            'WHERE ("person"."dob" < ?)'), [datetime.date(1980, 1, 1)])
+
+    def test_from_clause(self):
+        query = (Note
+                 .select(Note.content, Person.name)
+                 .from_(Note, Person)
+                 .where(Note.person_id == Person.id)
+                 .order_by(Note.id))
+        self.assertSQL(query, (
+            'SELECT "note"."content", "person"."name" '
+            'FROM "note", "person" '
+            'WHERE ("note"."person_id" = "person"."id") '
+            'ORDER BY "note"."id"'), [])
+
+    def test_from_query(self):
+        inner = Person.select(Person.name).alias('i1')
+        query = (Person
+                 .select(inner.c.name)
+                 .from_(inner))
+        self.assertSQL(query, (
+            'SELECT "i1"."name" '
+            'FROM (SELECT "person"."name" FROM "person") AS "i1"'), [])
+
+        PA = Person.alias('pa')
+        inner = PA.select(PA.name).alias('i1')
+        query = (Person
+                 .select(inner.c.name)
+                 .from_(inner)
+                 .order_by(inner.c.name))
+        self.assertSQL(query, (
+            'SELECT "i1"."name" '
+            'FROM (SELECT "pa"."name" FROM "person" AS "pa") AS "i1" '
+            'ORDER BY "i1"."name"'), [])
+
+    def test_join_explicit_columns(self):
+        query = (Note
+                 .select(Note.content)
+                 .join(Person, on=(Note.person_id == Person.id))
+                 .where(Person.name == 'charlie')
+                 .order_by(Note.id.desc()))
+        self.assertSQL(query, (
+            'SELECT "note"."content" '
+            'FROM "note" '
+            'INNER JOIN "person" ON ("note"."person_id" = "person"."id") '
+            'WHERE ("person"."name" = ?) '
+            'ORDER BY "note"."id" DESC'), ['charlie'])
+
+    def test_multi_join(self):
+        Like = Table('likes')
+        LikeUser = User.alias('lu')
+        query = (Like
+                 .select(Tweet.c.content, User.c.username, LikeUser.c.username)
+                 .join(Tweet, on=(Like.c.tweet_id == Tweet.c.id))
+                 .join(User, on=(Tweet.c.user_id == User.c.id))
+                 .join(LikeUser, on=(Like.c.user_id == LikeUser.c.id))
+                 .where(LikeUser.c.username == 'charlie')
+                 .order_by(Tweet.c.timestamp))
+        self.assertSQL(query, (
+            'SELECT "tweets"."content", "users"."username", "lu"."username" '
+            'FROM "likes" '
+            'INNER JOIN "tweets" ON ("likes"."tweet_id" = "tweets"."id") '
+            'INNER JOIN "users" ON ("tweets"."user_id" = "users"."id") '
+            'INNER JOIN "users" AS "lu" ON ("likes"."user_id" = "lu"."id") '
+            'WHERE ("lu"."username" = ?) '
+            'ORDER BY "tweets"."timestamp"'), ['charlie'])
+
+    def test_correlated_subquery(self):
+        Employee = Table('employee', ['id', 'name', 'salary', 'dept'])
+        EA = Employee.alias('e2')
+        query = (Employee
+                 .select(Employee.id, Employee.name)
+                 .where(Employee.salary > (EA
+                                           .select(fn.AVG(EA.salary))
+                                           .where(EA.dept == Employee.dept))))
+        self.assertSQL(query, (
+            'SELECT "employee"."id", "employee"."name" '
+            'FROM "employee" '
+            'WHERE ("employee"."salary" > ('
+            'SELECT AVG("e2"."salary") '
+            'FROM "employee" AS "e2" '
+            'WHERE ("e2"."dept" = "employee"."dept")))'), [])
+
+    def test_multiple_where(self):
+        query = (Person
+                 .select(Person.name)
+                 .where(Person.dob < datetime.date(1980, 1, 1))
+                 .where(Person.dob > datetime.date(1950, 1, 1)))
+        self.assertSQL(query, (
+            'SELECT "person"."name" '
+            'FROM "person" '
+            'WHERE (("person"."dob" < ?) AND ("person"."dob" > ?))'),
+            [datetime.date(1980, 1, 1), datetime.date(1950, 1, 1)])
+
+    def test_simple_join(self):
+        query = (User
+                 .select(
+                     User.c.id,
+                     User.c.username,
+                     fn.COUNT(Tweet.c.id).alias('ct'))
+                 .join(Tweet, on=(Tweet.c.user_id == User.c.id))
+                 .group_by(User.c.id, User.c.username))
+        self.assertSQL(query, (
+            'SELECT "users"."id", "users"."username", '
+            'COUNT("tweets"."id") AS "ct" '
+            'FROM "users" '
+            'INNER JOIN "tweets" ON ("tweets"."user_id" = "users"."id") '
+            'GROUP BY "users"."id", "users"."username"'), [])
+
+    def test_subquery(self):
+        inner = (Tweet
+                 .select(fn.COUNT(Tweet.c.id).alias('ct'))
+                 .where(Tweet.c.user == User.c.id))
+        query = (User
+                 .select(User.c.username, inner.alias('iq'))
+                 .order_by(User.c.username))
+        self.assertSQL(query, (
+            'SELECT "users"."username", '
+            '(SELECT COUNT("tweets"."id") AS "ct" '
+            'FROM "tweets" '
+            'WHERE ("tweets"."user" = "users"."id")) AS "iq" '
+            'FROM "users" ORDER BY "users"."username"'), [])
+
+    def test_user_defined_alias(self):
+        UA = User.alias('alt')
+        query = (User
+                 .select(User.c.id, User.c.username, UA.c.nuggz)
+                 .join(UA, on=(User.c.id == UA.c.id))
+                 .order_by(UA.c.nuggz))
+        self.assertSQL(query, (
+            'SELECT "users"."id", "users"."username", "alt"."nuggz" '
+            'FROM "users" '
+            'INNER JOIN "users" AS "alt" ON ("users"."id" = "alt"."id") '
+            'ORDER BY "alt"."nuggz"'), [])
+
+    def test_complex_select(self):
+        Order = Table('orders', columns=(
+            'region',
+            'amount',
+            'product',
+            'quantity'))
+
+        regional_sales = (Order
+                          .select(
+                              Order.region,
+                              fn.SUM(Order.amount).alias('total_sales'))
+                          .group_by(Order.region)
+                          .cte('regional_sales'))
+
+        top_regions = (regional_sales
+                       .select(regional_sales.c.region)
+                       .where(regional_sales.c.total_sales > (
+                           regional_sales.select(
+                               fn.SUM(regional_sales.c.total_sales) / 10)))
+                       .cte('top_regions'))
+
+        query = (Order
+                 .select(
+                     Order.region,
+                     Order.product,
+                     fn.SUM(Order.quantity).alias('product_units'),
+                     fn.SUM(Order.amount).alias('product_sales'))
+                 .where(
+                     Order.region << top_regions.select(top_regions.c.region))
+                 .group_by(Order.region, Order.product)
+                 .with_cte(regional_sales, top_regions))
+
+        self.assertSQL(query, (
+            'WITH "regional_sales" AS ('
+            'SELECT "orders"."region", SUM("orders"."amount") AS "total_sales"'
+            ' FROM "orders" '
+            'GROUP BY "orders"."region"'
+            '), '
+            '"top_regions" AS ('
+            'SELECT "regional_sales"."region" '
+            'FROM "regional_sales" '
+            'WHERE ("regional_sales"."total_sales" > '
+            '(SELECT (SUM("regional_sales"."total_sales") / ?) '
+            'FROM "regional_sales"))'
+            ') '
+            'SELECT "orders"."region", "orders"."product", '
+            'SUM("orders"."quantity") AS "product_units", '
+            'SUM("orders"."amount") AS "product_sales" '
+            'FROM "orders" '
+            'WHERE ('
+            '"orders"."region" IN ('
+            'SELECT "top_regions"."region" '
+            'FROM "top_regions")'
+            ') GROUP BY "orders"."region", "orders"."product"'), [10])
+"""
+    def test_compound_select(self):
+        lhs = User.select(User.c.id).where(User.c.username == 'charlie')
+        rhs = User.select(User.c.username).where(User.c.admin == True)
+        q2 = (lhs | rhs)
+        UA = User.alias('U2')
+        q3 = q2 | UA.select(UA.c.id).where(UA.c.superuser == False)
+
+        self.assertSQL(q3, (
+            'SELECT "t1"."id" '
+            'FROM "users" AS "t1" '
+            'WHERE ("t1"."username" = ?) '
+            'UNION '
+            'SELECT "t2"."username" '
+            'FROM "users" AS "t2" '
+            'WHERE ("t2"."admin" = ?) '
+            'UNION '
+            'SELECT "U2"."id" '
+            'FROM "users" AS "U2" '
+            'WHERE ("U2"."superuser" = ?)'), ['charlie', True, False])
+
+    def test_join_on_query(self):
+        inner = User.select(User.c.id).alias('j1')
+        query = (Tweet
+                 .select(Tweet.c.content)
+                 .join(inner, on=(Tweet.c.user_id == inner.c.id)))
+        self.assertSQL(query, (
+            'SELECT "t1"."content" FROM "tweets" AS "t1" '
+            'INNER JOIN (SELECT "t2"."id" FROM "users" AS "t2") AS "j1" '
+            'ON ("t1"."user_id" = "j1"."id")'), [])
+
+    def test_join_on_misc(self):
+        cond = fn.Magic(Person.id, Note.id).alias('magic')
+        query = Person.select(Person.id).join(Note, on=cond)
+        self.assertSQL(query, (
+            'SELECT "t1"."id" FROM "person" AS "t1" '
+            'INNER JOIN "note" AS "t2" '
+            'ON Magic("t1"."id", "t2"."id") AS "magic"'), [])
+
+
+class TestInsertQuery(BaseTestCase):
+    def test_insert_query(self):
+        query = User.insert({
+            User.c.username: 'charlie',
+            User.c.superuser: False,
+            User.c.admin: True})
+        self.assertSQL(query, (
+            'INSERT INTO "users" ("admin", "superuser", "username") '
+            'VALUES (?, ?, ?)'), [True, False, 'charlie'])
+
+    def test_insert_list(self):
+        data = [
+            {Person.name: 'charlie'},
+            {Person.name: 'huey'},
+            {Person.name: 'zaizee'}]
+        query = Person.insert(data)
+        self.assertSQL(query, (
+            'INSERT INTO "person" ("name") VALUES (?), (?), (?)'),
+            ['charlie', 'huey', 'zaizee'])
+
+    def test_insert_query(self):
+        source = User.select(User.c.username).where(User.c.admin == False)
+        query = Person.insert(source, columns=[Person.name])
+        self.assertSQL(query, (
+            'INSERT INTO "person" ("name") '
+            'SELECT "t1"."username" FROM "users" AS "t1" '
+            'WHERE ("t1"."admin" = ?)'), [False])
+
+    def test_insert_query_cte(self):
+        cte = User.select(User.c.username).cte('foo')
+        source = cte.select(cte.c.username)
+        query = Person.insert(source, columns=[Person.name]).with_cte(cte)
+        self.assertSQL(query, (
+            'WITH "foo" AS (SELECT "t1"."username" FROM "users" AS "t1") '
+            'INSERT INTO "person" ("name") '
+            'SELECT "foo"."username" FROM "foo"'), [])
+
+    def test_insert_returning(self):
+        query = (Person
+                 .insert({
+                     Person.name: 'zaizee',
+                     Person.dob: datetime.date(2000, 1, 2)})
+                 .returning(Person.id, Person.name, Person.dob))
+        self.assertSQL(query, (
+            'INSERT INTO "person" ("dob", "name") '
+            'VALUES (?, ?) RETURNING "id", "name", "dob"'),
+            [datetime.date(2000, 1, 2), 'zaizee'])
+
+    def test_empty(self):
+        class Empty(TestModel): pass
+        query = Empty.insert()
+        if isinstance(db, MySQLDatabase):
+            sql = 'INSERT INTO "empty" () VALUES ()'
+        elif isinstance(db, PostgresqlDatabase):
+            sql = 'INSERT INTO "empty" DEFAULT VALUES RETURNING "id"'
+        else:
+            sql = 'INSERT INTO "empty" DEFAULT VALUES'
+        self.assertSQL(query, sql, [])
+
+
+class TestUpdateQuery(BaseTestCase):
+    def test_update_query(self):
+        query = (User
+                 .update({
+                     User.c.username: 'nuggie',
+                     User.c.admin: False,
+                     User.c.counter: User.c.counter + 1})
+                 .where(User.c.username == 'nugz'))
+        self.assertSQL(query, (
+            'UPDATE "users" SET '
+            '"admin" = ?, '
+            '"counter" = ("counter" + ?), '
+            '"username" = ? '
+            'WHERE ("username" = ?)'), [False, 1, 'nuggie', 'nugz'])
+
+    def test_update_subquery(self):
+        subquery = (User
+                    .select(User.c.id, fn.COUNT(Tweet.c.id).alias('ct'))
+                    .join(Tweet, on=(Tweet.c.user_id == User.c.id))
+                    .group_by(User.c.id)
+                    .having(SQL('ct') > 100))
+        query = (User
+                 .update({
+                     User.c.muted: True,
+                     User.c.counter: 0})
+                 .where(User.c.id << subquery))
+        self.assertSQL(query, (
+            'UPDATE "users" SET '
+            '"counter" = ?, '
+            '"muted" = ? '
+            'WHERE ("id" IN ('
+            'SELECT "users"."id", COUNT("t1"."id") AS "ct" '
+            'FROM "users" AS "users" '
+            'INNER JOIN "tweets" AS "t1" '
+            'ON ("t1"."user_id" = "users"."id") '
+            'GROUP BY "users"."id" '
+            'HAVING (ct > ?)))'), [0, True, 100])
+
+    def test_update_returning(self):
+        query = (User
+                 .update({User.c.is_admin: True})
+                 .where(User.c.username == 'charlie')
+                 .returning(User.c.id))
+        self.assertSQL(query, (
+            'UPDATE "users" SET "is_admin" = ? WHERE ("username" = ?) '
+            'RETURNING "id"'), [True, 'charlie'])
+
+
+class TestDeleteQuery(BaseTestCase):
+    def test_delete_query(self):
+        query = (User
+                 .delete()
+                 .where(User.c.username != 'charlie')
+                 .limit(3))
+        self.assertSQL(
+            query,
+            'DELETE FROM "users" WHERE ("username" != ?) LIMIT 3',
+            ['charlie'])
+
+    def test_delete_subquery(self):
+        subquery = (User
+                    .select(User.c.id, fn.COUNT(Tweet.c.id).alias('ct'))
+                    .join(Tweet, on=(Tweet.c.user_id == User.c.id))
+                    .group_by(User.c.id)
+                    .having(SQL('ct') > 100))
+        query = (User
+                 .delete()
+                 .where(User.c.id << subquery))
+        self.assertSQL(query, (
+            'DELETE FROM "users" '
+            'WHERE ("id" IN ('
+            'SELECT "users"."id", COUNT("t1"."id") AS "ct" '
+            'FROM "users" AS "users" '
+            'INNER JOIN "tweets" AS "t1" ON ("t1"."user_id" = "users"."id") '
+            'GROUP BY "users"."id" '
+            'HAVING (ct > ?)))'), [100])
+
+    def test_delete_cte(self):
+        cte = (User
+               .select(User.c.id)
+               .where(User.c.admin == True)
+               .cte('u'))
+        query = (User
+                 .delete()
+                 .where(User.c.id << cte.select(cte.c.id))
+                 .with_cte(cte))
+        self.assertSQL(query, (
+            'WITH "u" AS '
+            '(SELECT "t1"."id" FROM "users" AS "t1" WHERE ("t1"."admin" = ?)) '
+            'DELETE FROM "users" '
+            'WHERE ("id" IN (SELECT "u"."id" FROM "u"))'), [True])
+
+    def test_delete_returning(self):
+        query = (User
+                 .delete()
+                 .where(User.c.id > 2)
+                 .returning(User.c.username))
+        self.assertSQL(query, (
+            'DELETE FROM "users" '
+            'WHERE ("id" > ?) '
+            'RETURNING "username"'), [2])
+
+        query = query.returning(User.c.id, User.c.username, SQL('1'))
+        self.assertSQL(query, (
+            'DELETE FROM "users" '
+            'WHERE ("id" > ?) '
+            'RETURNING "id", "username", 1'), [2])
+
+    def test_select(self):
         q = User.select().where(User.is_admin == True)
-        sql, params = __sql__(q)
-        self.assertEqual(sql, ('SELECT "users"."id", "users"."username", '
+        self.assertSQL(q, ('SELECT "users"."id", "users"."username", '
                                '"users"."is_admin" '
                                'FROM "users" '
                                'WHERE ("users"."is_admin" = ?)'))
@@ -881,6 +1300,7 @@ class TestQueryExecution(BaseTestCase):
         self.assertEqual([row.name for row in curs],
                          ['huey', 'mickey'])
 
+"""
 
 if __name__ == '__main__':
     unittest.main(argv=sys.argv)
