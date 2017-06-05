@@ -464,7 +464,7 @@ class TestHelpers(BaseTestCase):
 
         db.connect()
         self.assertFalse(db.is_closed())
-        self.assertRaises(sqlite3.InterfaceError, db.connect)
+        self.assertRaises(sqlite3.OperationalError, db.connect)
 
         self.assertTrue(db.close())
         self.assertFalse(db.close())
@@ -475,6 +475,193 @@ class TestHelpers(BaseTestCase):
             self.assertFalse(db.autocommit)
 
         self.assertTrue(db.is_closed())
+
+    def test_connection_initialization(self):
+        state = {'count': 0}
+        class TestDatabase(Database):
+            def initialize_connection(self, conn):
+                state['count'] += 1
+        db = TestDatabase(':memory:')
+        self.assertEqual(state['count'], 0)
+
+        conn = db.connection()
+        self.assertEqual(state['count'], 1)
+
+        # Since already connected, nothing happens here.
+        conn = db.connection()
+        self.assertEqual(state['count'], 1)
+
+    def test_connect_semantics(self):
+        state = {'count': 0}
+        class TestDatabase(Database):
+            def initialize_connection(self, conn):
+                state['count'] += 1
+        db = TestDatabase(':memory:')
+
+        db.connect()
+        self.assertEqual(state['count'], 1)
+        self.assertRaises(sqlite3.OperationalError, db.connect)
+        self.assertEqual(state['count'], 1)
+
+        self.assertFalse(db.connect(reuse_if_open=True))
+        self.assertEqual(state['count'], 1)
+
+        with db:
+            self.assertEqual(state['count'], 1)
+            self.assertFalse(db.is_closed())
+
+        self.assertTrue(db.is_closed())
+        with db:
+            self.assertEqual(state['count'], 2)
+
+    def test_execute_sql(self):
+        db = Database(':memory:')
+        with db:
+            db.execute_sql('CREATE TABLE register (val INTEGER);')
+            db.execute_sql('INSERT INTO register (val) VALUES (?), (?)',
+                                      (1337, 31337))
+            cursor = db.execute_sql(
+                'SELECT val FROM register ORDER BY val')
+            self.assertEqual(cursor.fetchall(), [(1337,), (31337,)])
+            db.execute_sql('DROP TABLE register;')
+
+    def test_sqlite_isolation(self):
+        self._db.execute_sql('CREATE TABLE users ('
+                             'id INTEGER NOT NULL PRIMARY KEY, '
+                             'username TEXT NOT NULL)')
+        for username in ('u1', 'u2', 'u3'):
+            User.insert({User.c.username: username}).execute(self._db)
+
+        new_db = Database(self.__db_filename__)
+        curs = new_db.execute_sql('SELECT COUNT(*) FROM users')
+        self.assertEqual(curs.fetchone()[0], 3)
+
+        user_count = User.select(User.c.username).count(self._db)
+        self.assertEqual(user_count, 3)
+        self.assertEqual(User.delete().execute(self._db), 3)
+
+        with self._db.atomic():
+            User.insert(({User.c.username: 'u4'},
+                         {User.c.username: 'u5'})).execute(self._db)
+
+            # Second conn does not see the changes.
+            curs = new_db.execute_sql('SELECT COUNT(*) FROM users')
+            self.assertEqual(curs.fetchone()[0], 0)
+
+            # Third conn does not see the changes.
+            new_db2 = Database(self.__db_filename__)
+            curs = new_db2.execute_sql('SELECT COUNT(*) FROM users')
+            self.assertEqual(curs.fetchone()[0], 0)
+
+            # Original connection sees its own changes.
+            query = User.select(User.c.id)
+            self.assertEqual(query.count(self._db), 2)
+
+        curs = new_db.execute_sql('SELECT COUNT(*) FROM users')
+        self.assertEqual(curs.fetchone()[0], 2)
+
+
+class TestIntrospection(BaseTestCase):
+    ddl = """
+        CREATE TABLE "person" (
+            "id" INTEGER NOT NULL PRIMARY KEY,
+            "first" TEXT NOT NULL,
+            "last" TEXT NOT NULL,
+            "dob" DATE NOT NULL);
+        CREATE UNIQUE INDEX "person_name_dob" ON "person" (
+            "first", "last", "dob");
+        CREATE INDEX "person_name" ON "person" ("last", "first");
+        CREATE INDEX "person_dob" ON "person" ("dob" DESC);
+
+        CREATE TABLE "note" (
+            "id" INTEGER NOT NULL PRIMARY KEY,
+            "person_id" INTEGER NOT NULL,
+            "content" TEXT NOT NULL,
+            "timestamp" INTEGER NOT NULL,
+            FOREIGN KEY ("person_id") REFERENCES "person" ("id"));
+        CREATE INDEX "note_person_id" ON "note" ("person_id");
+
+        CREATE TABLE "relationship" (
+            "from_person_id" INTEGER NOT NULL,
+            "to_person_id" INTEGER NOT NULL,
+            "flags" INTEGER,
+            PRIMARY KEY ("from_person_id", "to_person_id"),
+            FOREIGN KEY ("from_person_id") REFERENCES "person" ("id"),
+            FOREIGN KEY ("to_person_id") REFERENCES "person" ("id")
+            ) WITHOUT ROWID;
+
+        CREATE TABLE "note_tag" (
+            "note_id" INTEGER NOT NULL,
+            "tag" TEXT NOT NULL COLLATE NOCASE DEFAULT '',
+            PRIMARY KEY ("note_id", "tag"),
+            FOREIGN KEY ("note_id") REFERENCES "note" ("id")
+            ) WITHOUT ROWID;
+        """
+
+    def setUp(self):
+        super(TestIntrospection, self).setUp()
+        self.db = Database(':memory:')
+        self.db.foreign_keys = 'on'
+        conn = self.db.connection()
+        conn.executescript(self.ddl)
+
+    def tearDown(self):
+        super(TestIntrospection, self).tearDown()
+        self.db.close()
+
+    def test_get_tables(self):
+        self.assertEqual(self.db.get_tables(), [
+            'note',
+            'note_tag',
+            'person',
+            'relationship'])
+
+        self.db.execute_sql('DROP TABLE "note";')
+        self.db.execute_sql('DROP TABLE "note_tag";')
+        self.assertEqual(self.db.get_tables(), [ 'person', 'relationship'])
+
+    def test_get_indexes(self):
+        indexes = self.db.get_indexes('person')
+        without_sql = [(index[0], index[2], index[3]) for index in indexes]
+        self.assertEqual(without_sql, [
+            ('person_dob', ['dob'], False),
+            ('person_name', ['last', 'first'], False),
+            ('person_name_dob', ['first', 'last', 'dob'], True)])
+
+        indexes = self.db.get_indexes('note')
+        self.assertEqual(indexes, [
+            ('note_person_id',
+             'CREATE INDEX "note_person_id" ON "note" ("person_id")',
+             ['person_id'],
+             False)])
+
+    def test_get_columns(self):
+        self.assertEqual(self.db.get_columns('person'), [
+            ('id', 'INTEGER', False, True),
+            ('first', 'TEXT', False, False),
+            ('last', 'TEXT', False, False),
+            ('dob', 'DATE', False, False)])
+
+        self.assertEqual(self.db.get_columns('note_tag'), [
+            ('note_id', 'INTEGER', False, True),
+            ('tag', 'TEXT', False, True)])
+
+    def test_get_primary_keys(self):
+        self.assertEqual(self.db.get_primary_keys('person'), ['id'])
+        self.assertEqual(self.db.get_primary_keys('relationship'),
+                         ['from_person_id', 'to_person_id'])
+        self.assertEqual(self.db.get_primary_keys('note_tag'),
+                         ['note_id', 'tag'])
+
+    def test_get_foreign_keys(self):
+        self.assertEqual(self.db.get_foreign_keys('person'), [])
+        self.assertEqual(self.db.get_foreign_keys('note'), [
+            ('person_id', 'person', 'id')])
+        self.assertEqual(sorted(self.db.get_foreign_keys('relationship')), [
+            ('from_person_id', 'person', 'id'),
+            ('to_person_id', 'person', 'id')])
+        self.assertEqual(sorted(self.db.get_foreign_keys('note_tag')), [
+            ('note_id', 'note', 'id')])
 
 
 #User = Table('users', ('id', 'username', 'is_admin'))
@@ -626,6 +813,22 @@ class TestQueryBuilder(BaseTestCase):
             'FROM "tweets" '
             'WHERE ("tweets"."user" = "users"."id")) AS "iq" '
             'FROM "users" ORDER BY "users"."username"'), [])
+
+    def test_filter(self):
+        query = User.filter(username__in=('charlie', 'huey', 'zaizee'))
+        self.assertSQL(query.select(User.c.id), (
+            'SELECT "users"."id" FROM "users" '
+            'WHERE ("users"."username" IN (?, ?, ?))'),
+            ['charlie', 'huey', 'zaizee'])
+
+    def test_string_concatenation(self):
+        P = Table('person', ['first', 'last', 'dob'])
+        query = (P
+                 .select((P.last + ', ' + P.first).alias('name'))
+                 .order_by(SQL('name').desc()))
+        self.assertSQL(query, (
+            'SELECT (("person"."last" || ?) || "person"."first") AS "name" '
+            'FROM "person" ORDER BY name DESC'), [', '])
 
     def test_user_defined_alias(self):
         UA = User.alias('alt')

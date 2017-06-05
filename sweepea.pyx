@@ -979,7 +979,8 @@ cdef class CursorWrapper(object):
                 self.fill_cache(stop)
             return self.result_cache[item]
         elif isinstance(item, int):
-            self.fill_cache(item if item > 0 else 0)
+            fill_line = item + 1 if item >= 0 else item
+            self.fill_cache(fill_line if item > 0 else 0)
             return self.result_cache[item]
         else:
             raise ValueError('CursorWrapper only supports integer and slice '
@@ -1365,7 +1366,7 @@ cdef class Database(object):
                 if self._update_hook is not None:
                     sqlite3_update_hook(conn.db, NULL, NULL)
 
-    cpdef connect(self):
+    cpdef connect(self, reuse_if_open=False):
         """
         Check that connection is closed, then create a new connection to the
         given pysqlite database.
@@ -1377,7 +1378,10 @@ cdef class Database(object):
             if self.deferred:
                 raise InterfaceError('Database has not been initialized.')
             if not self._local.closed:
-                raise InterfaceError('Connection already open in this thread.')
+                if reuse_if_open:
+                    return False
+                raise OperationalError('Connection already open in this '
+                                       'thread.')
             self._local.conn = conn = self._connect()
             self._local.closed = False
             self.initialize_connection(conn)
@@ -1644,7 +1648,7 @@ cdef class Database(object):
         """Return a boolean indicating whether the DB is closed."""
         return self._local.closed
 
-    cdef connection(self):
+    cpdef connection(self):
         # Internal method for quickly getting (or opening) a connection.
         if self._local.closed:
             self.connect()
@@ -2076,6 +2080,20 @@ SCOPE_VALUES = 2
 SCOPE_CTE = 3
 SCOPE_COLUMN = 4
 
+DJANGO_OPERATIONS = {
+    'eq': '=',
+    'ne': '!=',
+    'gte': '>=',
+    'gt': '>',
+    'lte': '<=',
+    'lt': '<',
+    'in': 'IN',
+    'is': 'IS',
+    'is_not': 'IS NOT',
+    'like': 'LIKE',
+    'glob': 'GLOB',
+    'regexp': 'REGEXP'}
+
 
 cdef class State(object):
     """
@@ -2313,6 +2331,9 @@ class Table(BaseTable):
             for column in self._columns:
                 setattr(self, column, Column(self, column))
 
+    def __hash__(self):
+        return hash((self._schema, self._name, self._alias))
+
     def clone(self):
         return Table(self._name, self._columns, schema=self._schema,
                      alias=self._alias)
@@ -2332,6 +2353,29 @@ class Table(BaseTable):
 
     def delete(self):
         return Delete(self)
+
+    def filter(self, **kwargs):
+        accum = []
+        for key, value in kwargs.items():
+            if '__' in key:
+                key, op = key.rsplit('__', 1)
+            else:
+                op = 'eq'
+
+            if op not in DJANGO_OPERATIONS:
+                raise ValueError('Unrecognized operation: "%s". Supported '
+                                 'operations are: %s.' % (
+                                     op, ', '.join(sorted(DJANGO_OPERATIONS))))
+
+            if self._columns and key not in self._columns:
+                raise ValueError('Unable to find column "%s" on table "%s". '
+                                 'Available columns are: %s' %
+                                 (key, self._name, ', '.join(self._columns)))
+
+            col = Column(self, key)
+            accum.append(Expression(col, DJANGO_OPERATIONS[op], value))
+
+        return self.select().where(reduce(operator.and_, accum))
 
     def __sql__(self, Context ctx):
         if not self._alias:
@@ -2415,13 +2459,19 @@ class ColumnBase(Node):
     __and__ = __e__('AND')
     __or__ = __e__('OR')
 
-    __add__ = __e__('+')
+    def __add__(self, other):
+        if isinstance(other, basestring):
+            return self.concat(other)
+        return Expression(self, '+', other)
+    def __radd__(self, lhs):
+        if isinstance(lhs, basestring):
+            return Expression(lhs, '||', self)
+        return Expression(lhs, '+', self)
     __sub__ = __e__('-')
     __mul__ = __e__('*')
     __div__ = __e__('/')
     __rand__ = __e__('AND', True)
     __ror__ = __e__('OR', True)
-    __radd__ = __e__('+', True)
     __rsub__ = __e__('-', True)
     __rmul__ = __e__('*', True)
     __rdiv__ = __e__('/', True)
@@ -2463,6 +2513,9 @@ class Column(ColumnBase):
     def __init__(self, source, name):
         self.source = source
         self.name = name
+
+    def __hash__(self):
+        return hash((self.source, self.name))
 
     def __sql__(self, Context ctx):
         if ctx.scope == SCOPE_VALUES:
@@ -2795,6 +2848,10 @@ class SelectBase(Source, Query):
         return CTE(name, self, recursive, columns)
 
     @Node.copy
+    def tuples(self):
+        self._dicts = self._namedtuples = self._objects = False
+
+    @Node.copy
     def dicts(self, as_dict=True):
         self._dicts = as_dict
         self._namedtuples = self._objects = False
@@ -2825,6 +2882,21 @@ class SelectBase(Source, Query):
             self._cursor = cursor_wrapper_cls(database.execute(self))
         return self._cursor
 
+    def exists(self, database):
+        clone = self.select(SQL('1'))
+        clone._limit = 1
+        clone._offset = None
+        return bool(clone.execute(database).scalar())
+
+    def count(self, database, clear_limit=False):
+        clone = self.order_by().alias('_wrapped')
+        if clear_limit:
+            clone._limit = clone._offset = None
+
+        query = Select([clone], [fn.COUNT(SQL('1'))]).tuples()
+        cursor = query.execute(database)
+        return next(iter(cursor))[0]
+
 
 class CompoundSelect(SelectBase):
     def __init__(self, lhs, op, rhs):
@@ -2846,20 +2918,6 @@ class CompoundSelect(SelectBase):
                 ctx.sql(self.rhs)
         ctx = self.apply_ordering(ctx)
         return self.apply_alias(ctx)
-
-    def exists(self, database):
-        clone = self.select(SQL('1'))
-        clone._limit = 1
-        clone._offset = None
-        return bool(clone.execute(database).scalar())
-
-    def count(self, database, clear_limit=False):
-        clone = self.order_by().alias('_wrapped')
-        if clear_limit:
-            clone._limit = clone._offset = None
-
-        query = Select([clone], [fn.COUNT(SQL('1'))]).tuples()
-        return query.execute(database)[0][0]
 
 
 class Select(SelectBase):
