@@ -1206,7 +1206,7 @@ class TestQueryExecution(BaseTestCase):
         curs = (Message
                 .select(Account.name, Message.content)
                 .join(Account, on=(Message.account_id == Account.id))
-                .order_by(-Message.timestamp)
+                .order_by(Message.timestamp)
                 .limit(3)
                 .namedtuples()
                 .execute(database))

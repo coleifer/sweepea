@@ -1912,6 +1912,18 @@ cdef class Database(object):
     def backup_to_file(self, filename):
         return backup_to_file(self.connection(), filename)
 
+    def select(self, table):
+        return BoundSelect(self, (table,))
+
+    def insert(self, table, *args, **kwargs):
+        return BoundInsert(self, table, *args, **kwargs)
+
+    def update(self, table, *args, **kwargs):
+        return BoundUpdate(self, table, *args, **kwargs)
+
+    def delete(self, table):
+        return BoundDelete(self, table)
+
     # Pragma queries.
     cache_size = __pragma__('cache_size')
     foreign_keys = __pragma__('foreign_keys')
@@ -2445,7 +2457,7 @@ class ColumnBase(Node):
 
     def desc(self):
         return Desc(self)
-    __neg__ = asc
+    __neg__ = desc
 
     def __invert__(self):
         return Negated(self)
@@ -2837,12 +2849,6 @@ class SelectBase(Source, Query):
         self._namedtuples = False
         self._objects = False
         self._query_name = 'sq'
-        self._cursor = None
-
-    def clone(self):
-        query = super(SelectBase, self).clone()
-        query._cursor = None
-        return query
 
     def cte(self, name, recursive=False, columns=None):
         return CTE(name, self, recursive, columns)
@@ -2877,16 +2883,19 @@ class SelectBase(Source, Query):
             return CursorWrapper
 
     def execute(self, database):
-        if self._cursor is None:
-            cursor_wrapper_cls = self.get_cursor_wrapper()
-            self._cursor = cursor_wrapper_cls(database.execute(self))
-        return self._cursor
+        cursor_wrapper_cls = self.get_cursor_wrapper()
+        return cursor_wrapper_cls(database.execute(self))
 
     def exists(self, database):
         clone = self.select(SQL('1'))
         clone._limit = 1
         clone._offset = None
-        return bool(clone.execute(database).scalar())
+        try:
+            clone.execute(database)
+        except DoesNotExist:
+            return False
+        else:
+            return True
 
     def count(self, database, clear_limit=False):
         clone = self.order_by().alias('_wrapped')
@@ -2935,7 +2944,6 @@ class Select(SelectBase):
         self._limit = limit
         self._offset = offset
         self._distinct = distinct
-        self._cursor = None
 
     @Node.copy
     def select(self, *columns):
@@ -3161,6 +3169,36 @@ class Delete(WriteQuery):
     def execute(self, Database database):
         cursor = database.execute(self)
         return cursor.rowcount
+
+
+class _BoundQuery(object):
+    def __init__(self, database, *args, **kwargs):
+        self._database = database
+        super(_BoundQuery, self).__init__(*args, **kwargs)
+
+    def execute(self):
+        return super(_BoundQuery, self).execute(self.database)
+
+
+class BoundSelect(_BoundQuery, Select):
+    def __init__(self, *args, **kwargs):
+        super(BoundSelect, self).__init__(*args, **kwargs)
+        self._cursor = None
+
+    def clone(self):
+        clone = super(BoundSelect, self).clone()
+        clone._cursor = None
+        return clone
+
+    def __iter__(self):
+        if self._cursor is None:
+            self.execute()
+        return self._cursor
+
+
+class BoundUpdate(_BoundQuery, Update): pass
+class BoundInsert(_BoundQuery, Insert): pass
+class BoundDelete(_BoundQuery, Delete): pass
 
 
 SQLITE_DATETIME_FORMATS = (
