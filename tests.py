@@ -1330,6 +1330,40 @@ class TestQueryExecution(BaseTestCase):
                 self.assertEqual([row.account_name for row in query],
                                  ['zaizee', 'charlie'])
 
+        query = query.where(Account.name.endswith('ie'))
+        with self.assertQueryCount(1):
+            for _ in range(3):
+                self.assertEqual([row.account_name for row in query],
+                                 ['charlie'])
+
+    def test_bound_queries(self):
+        names = ('charlie', 'huey', 'zaizee')
+        bi = database.insert(Account, [{Account.name: name} for name in names])
+        self.assertTrue(bi.execute() >= 3)
+
+        query = (database
+                 .select(Account, Account.name)
+                 .order_by(-Account.name)
+                 .dicts())
+        self.assertEqual(query[:], [{'name': 'zaizee'},
+                                    {'name': 'huey'},
+                                    {'name': 'charlie'}])
+
+        bu = (database
+              .update(Account, {Account.name: Account.name.concat(', jr')})
+              .where(Account.name != 'charlie'))
+        self.assertEqual(bu.execute(), 2)
+
+        query = query.order_by(Account.name).tuples()
+        self.assertEqual([name for name, in query],
+                         ['charlie', 'huey, jr', 'zaizee, jr'])
+
+        bd = database.delete(Account).where(Account.name.endswith(', jr'))
+        self.assertEqual(bd.execute(), 2)
+
+        query = database.select(Account, Account.name)
+        self.assertEqual([name for name, in query], ['charlie'])
+
 
 if __name__ == '__main__':
     unittest.main(argv=sys.argv)
