@@ -1,6 +1,8 @@
 from collections import Counter
 from collections import OrderedDict
+from contextlib import contextmanager
 import datetime
+import logging
 import os
 import re
 import sys
@@ -74,19 +76,52 @@ class Split(TableFunction):
         raise StopIteration
 
 
+logger = logging.getLogger('sweepea')
+
+
+class QueryLogHandler(logging.Handler):
+    def __init__(self, *args, **kwargs):
+        self.queries = []
+        logging.Handler.__init__(self, *args, **kwargs)
+
+    def emit(self, record):
+        self.queries.append(record)
+
+
 class BaseTestCase(unittest.TestCase):
+    def setUp(self):
+        self._qh = QueryLogHandler()
+        logger.setLevel(logging.DEBUG)
+        logger.addHandler(self._qh)
+
+    def tearDown(self):
+        logger.removeHandler(self._qh)
+
     def assertSQL(self, query, sql, params=None):
         params = [] if params is None else params
         qsql, qparams = Context().parse(query)
         self.assertEqual(qsql, sql)
-        self.assertEqual(qparams, params)
+        if params is not None:
+            self.assertEqual(qparams, params)
+
+    @property
+    def history(self):
+        return self._qh.queries
+
+    @contextmanager
+    def assertQueryCount(self, num):
+        qc = len(self.history)
+        yield
+        self.assertEqual(len(self.history) - qc, num)
 
 
 class TestTableFunction(BaseTestCase):
     def setUp(self):
+        super(TestTableFunction, self).setUp()
         self.conn = sqlite3.connect(':memory:')
 
     def tearDown(self):
+        super(TestTableFunction, self).tearDown()
         self.conn.close()
 
     def test_split(self):
@@ -1278,6 +1313,22 @@ class TestQueryExecution(BaseTestCase):
                 .execute(database))
         self.assertEqual([row.name for row in curs],
                          ['huey', 'mickey'])
+
+    def _create_accounts(self, *names):
+        iq = Account.insert([{Account.name: name} for name in names])
+        return iq.execute(database)
+
+    def test_bound_select_caching(self):
+        self._create_accounts('charlie', 'huey', 'zaizee')
+        query = (database
+                 .select(Account, Account.name.alias('account_name'))
+                 .where(fn.LOWER(fn.SUBSTR(Account.name, 1, 1)) << ['c', 'z'])
+                 .order_by(-Account.name)
+                 .namedtuples())
+        with self.assertQueryCount(1):
+            for _ in range(3):
+                self.assertEqual([row.account_name for row in query],
+                                 ['zaizee', 'charlie'])
 
 
 if __name__ == '__main__':

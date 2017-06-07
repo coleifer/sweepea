@@ -14,6 +14,7 @@ from random import randint
 import decimal
 import hashlib
 import itertools
+import logging
 import operator
 import re
 import sqlite3 as pysqlite
@@ -24,6 +25,17 @@ import zlib
 from sqlite3 import DatabaseError
 from sqlite3 import InterfaceError
 from sqlite3 import OperationalError
+
+
+try:  # Python 2.7+
+    from logging import NullHandler
+except ImportError:
+    class NullHandler(logging.Handler):
+        def emit(self, record):
+            pass
+
+logger = logging.getLogger('sweepea')
+logger.addHandler(NullHandler())
 
 
 cdef struct sqlite3_index_constraint:
@@ -1656,6 +1668,7 @@ cdef class Database(object):
 
     cpdef execute_sql(self, sql, params=None, commit=True):
         """Execute the given SQL query and return the cursor."""
+        logger.debug((sql, params))
         if self._local.closed:
             self.connect()
         cursor = self._local.conn.cursor()
@@ -1912,8 +1925,8 @@ cdef class Database(object):
     def backup_to_file(self, filename):
         return backup_to_file(self.connection(), filename)
 
-    def select(self, table):
-        return BoundSelect(self, (table,))
+    def select(self, table, *columns):
+        return BoundSelect(self, (table,), columns)
 
     def insert(self, table, *args, **kwargs):
         return BoundInsert(self, table, *args, **kwargs)
@@ -3177,7 +3190,7 @@ class _BoundQuery(object):
         super(_BoundQuery, self).__init__(*args, **kwargs)
 
     def execute(self):
-        return super(_BoundQuery, self).execute(self.database)
+        return super(_BoundQuery, self).execute(self._database)
 
 
 class BoundSelect(_BoundQuery, Select):
@@ -3192,8 +3205,8 @@ class BoundSelect(_BoundQuery, Select):
 
     def __iter__(self):
         if self._cursor is None:
-            self.execute()
-        return self._cursor
+            self._cursor = self.execute()
+        return iter(self._cursor)
 
 
 class BoundUpdate(_BoundQuery, Update): pass
