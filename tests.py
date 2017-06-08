@@ -1364,6 +1364,9 @@ class TestQueryExecution(BaseTestCase):
         query = database.select(Account, Account.name)
         self.assertEqual([name for name, in query], ['charlie'])
 
+    def test_bound_table(self):
+        BAccount = Account.bind(database)
+
 
 if __name__ == '__main__':
     unittest.main(argv=sys.argv)

@@ -1720,7 +1720,7 @@ cdef class Database(object):
             UserTbl = db['users']
             query = UserTbl.select(...)
         """
-        return Table(name)
+        return BoundTable(self, name)
 
     def __enter__(self):
         self.connection()
@@ -2363,6 +2363,10 @@ class Table(BaseTable):
         return Table(self._name, self._columns, schema=self._schema,
                      alias=self._alias)
 
+    def bind(self, database):
+        return BoundTable(database, self._name, self._columns,
+                          schema=self._schema, alias=self._alias)
+
     def select(self, *selection):
         if not selection and self._columns:
             selection = [Column(self, column) for column in self._columns]
@@ -2409,6 +2413,31 @@ class Table(BaseTable):
         if ctx.scope == SCOPE_SOURCE:
             ctx.sql(Entity(*self._path)).literal(' AS ')
         return ctx.sql(Entity(self._alias))
+
+
+class BoundTable(Table):
+    def __init__(self, database, *args, **kwargs):
+        self._database = database
+        super(BoundTable, self).__init__(*args, **kwargs)
+
+    def clone(self):
+        return BoundTable(self._database, self._name, self._columns,
+                          schema=self._schema, alias=self._alias)
+
+    def select(self, *selection):
+        if not selection and self._columns:
+            selection = [Column(self, column) for column in self._columns]
+        return BoundSelect(self._database, (self,), selection)
+
+    def insert(self, data=None, **kwargs):
+        return BoundInsert(self._database, self, data, **kwargs)
+
+    def update(self, data=None, **kwargs):
+        # TODO: normalize
+        return BoundUpdate(self._database, self, data)
+
+    def delete(self):
+        return BoundDelete(self._database, self)
 
 
 class Join(BaseTable):
