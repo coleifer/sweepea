@@ -1365,7 +1365,14 @@ class TestQueryExecution(BaseTestCase):
         self.assertEqual([name for name, in query], ['charlie'])
 
     def test_bound_table(self):
+        self._create_accounts('charlie', 'huey', 'zaizee')
         BAccount = Account.bind(database)
+        query = (BAccount
+                 .select(BAccount.name)
+                 .where(BAccount.name.endswith('e'))
+                 .order_by(BAccount.name))
+        self.assertEqual([row for row, in query], ['charlie', 'zaizee'])
+
 
 
 if __name__ == '__main__':
