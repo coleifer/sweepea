@@ -1925,18 +1925,6 @@ cdef class Database(object):
     def backup_to_file(self, filename):
         return backup_to_file(self.connection(), filename)
 
-    def select(self, table, *columns):
-        return BoundSelect(self, (table,), columns)
-
-    def insert(self, table, *args, **kwargs):
-        return BoundInsert(self, table, *args, **kwargs)
-
-    def update(self, table, *args, **kwargs):
-        return BoundUpdate(self, table, *args, **kwargs)
-
-    def delete(self, table):
-        return BoundDelete(self, table)
-
     # Pragma queries.
     cache_size = __pragma__('cache_size')
     foreign_keys = __pragma__('foreign_keys')
