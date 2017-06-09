@@ -1029,7 +1029,7 @@ cdef class CursorWrapper(object):
 
     def iterator(self):
         while True:
-            yield self.iterate()
+            yield self.iterate(cache=False)
 
     cpdef fill_cache(self, n=None):
         cdef:
