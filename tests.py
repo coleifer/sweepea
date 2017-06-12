@@ -235,22 +235,27 @@ class TestTableFunction(BaseTestCase):
         ])
 
 
-class TestHelpers(BaseTestCase):
-    __db_filename__ = 'test.db'
+class BaseDatabaseTestCase(BaseTestCase):
+    __db_filename__ = ':memory:'
 
     def setUp(self):
-        super(TestHelpers, self).setUp()
+        super(BaseDatabaseTestCase, self).setUp()
         self._db = Database(self.__db_filename__)
         self._db.connect()
 
     def tearDown(self):
-        super(TestHelpers, self).tearDown()
+        super(BaseDatabaseTestCase, self).tearDown()
         self._db.close()
-        if os.path.exists(self.__db_filename__):
+        if self.__db_filename__ != ':memory:' and \
+           os.path.exists(self.__db_filename__):
             os.unlink(self.__db_filename__)
 
     def execute(self, sql, *params):
         return self._db.execute_sql(sql, params, commit=False)
+
+
+class TestHelpers(BaseDatabaseTestCase):
+    __db_filename__ = 'test.db'
 
     def test_autocommit(self):
         self.assertTrue(self._db.autocommit)
@@ -596,7 +601,7 @@ class TestHelpers(BaseTestCase):
         self.assertEqual(curs.fetchone()[0], 2)
 
 
-class TestIntrospection(BaseTestCase):
+class TestIntrospection(BaseDatabaseTestCase):
     ddl = """
         CREATE TABLE "person" (
             "id" INTEGER NOT NULL PRIMARY KEY,
@@ -635,35 +640,29 @@ class TestIntrospection(BaseTestCase):
 
     def setUp(self):
         super(TestIntrospection, self).setUp()
-        self.db = Database(':memory:')
-        self.db.foreign_keys = 'on'
-        conn = self.db.connection()
-        conn.executescript(self.ddl)
-
-    def tearDown(self):
-        super(TestIntrospection, self).tearDown()
-        self.db.close()
+        self._db.foreign_keys = 'on'
+        self._db.connection().executescript(self.ddl)
 
     def test_get_tables(self):
-        self.assertEqual(self.db.get_tables(), [
+        self.assertEqual(self._db.get_tables(), [
             'note',
             'note_tag',
             'person',
             'relationship'])
 
-        self.db.execute_sql('DROP TABLE "note";')
-        self.db.execute_sql('DROP TABLE "note_tag";')
-        self.assertEqual(self.db.get_tables(), [ 'person', 'relationship'])
+        self._db.execute_sql('DROP TABLE "note";')
+        self._db.execute_sql('DROP TABLE "note_tag";')
+        self.assertEqual(self._db.get_tables(), [ 'person', 'relationship'])
 
     def test_get_indexes(self):
-        indexes = self.db.get_indexes('person')
+        indexes = self._db.get_indexes('person')
         without_sql = [(index[0], index[2], index[3]) for index in indexes]
         self.assertEqual(without_sql, [
             ('person_dob', ['dob'], False),
             ('person_name', ['last', 'first'], False),
             ('person_name_dob', ['first', 'last', 'dob'], True)])
 
-        indexes = self.db.get_indexes('note')
+        indexes = self._db.get_indexes('note')
         self.assertEqual(indexes, [
             ('note_person_id',
              'CREATE INDEX "note_person_id" ON "note" ("person_id")',
@@ -671,31 +670,31 @@ class TestIntrospection(BaseTestCase):
              False)])
 
     def test_get_columns(self):
-        self.assertEqual(self.db.get_columns('person'), [
+        self.assertEqual(self._db.get_columns('person'), [
             ('id', 'INTEGER', False, True),
             ('first', 'TEXT', False, False),
             ('last', 'TEXT', False, False),
             ('dob', 'DATE', False, False)])
 
-        self.assertEqual(self.db.get_columns('note_tag'), [
+        self.assertEqual(self._db.get_columns('note_tag'), [
             ('note_id', 'INTEGER', False, True),
             ('tag', 'TEXT', False, True)])
 
     def test_get_primary_keys(self):
-        self.assertEqual(self.db.get_primary_keys('person'), ['id'])
-        self.assertEqual(self.db.get_primary_keys('relationship'),
+        self.assertEqual(self._db.get_primary_keys('person'), ['id'])
+        self.assertEqual(self._db.get_primary_keys('relationship'),
                          ['from_person_id', 'to_person_id'])
-        self.assertEqual(self.db.get_primary_keys('note_tag'),
+        self.assertEqual(self._db.get_primary_keys('note_tag'),
                          ['note_id', 'tag'])
 
     def test_get_foreign_keys(self):
-        self.assertEqual(self.db.get_foreign_keys('person'), [])
-        self.assertEqual(self.db.get_foreign_keys('note'), [
+        self.assertEqual(self._db.get_foreign_keys('person'), [])
+        self.assertEqual(self._db.get_foreign_keys('note'), [
             ('person_id', 'person', 'id')])
-        self.assertEqual(sorted(self.db.get_foreign_keys('relationship')), [
+        self.assertEqual(sorted(self._db.get_foreign_keys('relationship')), [
             ('from_person_id', 'person', 'id'),
             ('to_person_id', 'person', 'id')])
-        self.assertEqual(sorted(self.db.get_foreign_keys('note_tag')), [
+        self.assertEqual(sorted(self._db.get_foreign_keys('note_tag')), [
             ('note_id', 'note', 'id')])
 
 
@@ -1183,13 +1182,11 @@ class TestDeleteQuery(BaseTestCase):
             'WHERE ("id" IN (SELECT "u"."id" FROM "u"))'), [True])
 
 
-database = Database(':memory:')
-
 Account = Table('account', ('id', 'name'))
 Message = Table('message', ('id', 'account_id', 'content', 'timestamp'))
 
 
-class TestQueryExecution(BaseTestCase):
+class TestQueryExecution(BaseDatabaseTestCase):
     account_tbl = ('CREATE TABLE "account" (id INTEGER NOT NULL PRIMARY KEY, '
                    'name TEXT NOT NULL)')
     message_tbl = ('CREATE TABLE "message" (id INTEGER NOT NULL PRIMARY KEY, '
@@ -1198,14 +1195,9 @@ class TestQueryExecution(BaseTestCase):
 
     def setUp(self):
         super(TestQueryExecution, self).setUp()
-        database.connect()
 
-        database.execute_sql(self.account_tbl)
-        database.execute_sql(self.message_tbl)
-
-    def tearDown(self):
-        database.close()
-        super(TestQueryExecution, self).tearDown()
+        self.execute(self.account_tbl)
+        self.execute(self.message_tbl)
 
     def test_integration(self):
         iq = Account.insert((
@@ -1213,7 +1205,7 @@ class TestQueryExecution(BaseTestCase):
             {Account.name: 'huey'},
             {Account.name: 'mickey'},
             {Account.name: 'zaizee'}))
-        last_row_id = iq.execute(database)
+        last_row_id = iq.execute(self._db)
         self.assertEqual(last_row_id, 4)
 
         dt = datetime.datetime.now()
@@ -1221,13 +1213,13 @@ class TestQueryExecution(BaseTestCase):
             Message.account_id: 2,
             Message.content: 'meow',
             Message.timestamp: dt})
-        self.assertEqual(iq.execute(database), 1)
+        self.assertEqual(iq.execute(self._db), 1)
 
         q = (Account
              .select(Account.name, Message.content, Message.timestamp)
              .join(Message, on=(Account.id == Message.account_id))
              .order_by(Message.timestamp))
-        rows = q.execute(database)
+        rows = q.execute(self._db)
         self.assertEqual([tuple(r) for r in rows], [
             ('huey', 'meow', dt)])
 
@@ -1236,7 +1228,7 @@ class TestQueryExecution(BaseTestCase):
             {Message.account_id: 2, Message.content: 'hiss', Message.timestamp: D(1)},
             {Message.account_id: 3, Message.content: 'woof', Message.timestamp: D(2)},
             {Message.account_id: 2, Message.content: 'purr', Message.timestamp: D(3)})
-        Message.insert(data).execute(database)
+        Message.insert(data).execute(self._db)
 
         curs = (Message
                 .select(Account.name, Message.content)
@@ -1244,7 +1236,7 @@ class TestQueryExecution(BaseTestCase):
                 .order_by(Message.timestamp)
                 .limit(3)
                 .namedtuples()
-                .execute(database))
+                .execute(self._db))
         self.assertEqual([tuple(r) for r in curs], [
             ('huey', 'hiss'),
             ('mickey', 'woof'),
@@ -1255,7 +1247,7 @@ class TestQueryExecution(BaseTestCase):
             {Account.name: 'charlie'},
             {Account.name: 'huey'},
             {Account.name: 'mickey'},
-            {Account.name: 'zaizee'})).execute(database)
+            {Account.name: 'zaizee'})).execute(self._db)
 
     def test_cursor_wrappers(self):
         self._create_people()
@@ -1265,7 +1257,7 @@ class TestQueryExecution(BaseTestCase):
                      fn.SUBSTR(fn.MD5(Account.name), 1, 6).alias('hash'))
                  .order_by(Account.name))
 
-        dicts = list(query.dicts().execute(database))
+        dicts = list(query.dicts().execute(self._db))
         self.assertEqual(dicts, [
             {'hash': 'bf779e', 'name': 'charlie'},
             {'hash': 'ef6307', 'name': 'huey'},
@@ -1273,7 +1265,7 @@ class TestQueryExecution(BaseTestCase):
             {'hash': '7670f7', 'name': 'zaizee'},
         ])
 
-        objs = list(query.execute(database))
+        objs = list(query.execute(self._db))
         self.assertEqual(objs, [
             ('charlie', 'bf779e'),
             ('huey', 'ef6307'),
@@ -1283,7 +1275,7 @@ class TestQueryExecution(BaseTestCase):
     def test_cursor_iteration(self):
         self._create_people()
         query = Account.select(Account.name).order_by(Account.name)
-        cw = query.execute(database)
+        cw = query.execute(self._db)
         rows = [r for r in cw]
 
         self.assertEqual(cw[1], ('huey',))
@@ -1299,7 +1291,7 @@ class TestQueryExecution(BaseTestCase):
         query = (Account
                  .select(Account.name, fn.MD5(Account.name).alias('md5'))
                  .order_by(Account.name))
-        self.assertEqual([tuple(row) for row in query.execute(database)], [
+        self.assertEqual([tuple(row) for row in query.execute(self._db)], [
             ('charlie', 'bf779e0933a882808585d19455cd7937'),
             ('huey', 'ef63073058e004fb5e7f2b1f081c416f'),
             ('mickey', '4d5257e5acc7fcac2f5dcd66c4e78f9a'),
@@ -1310,17 +1302,17 @@ class TestQueryExecution(BaseTestCase):
                 .where(fn.REGEXP(Account.name, '^.+ey$'))
                 .order_by(Account.name)
                 .namedtuples()
-                .execute(database))
+                .execute(self._db))
         self.assertEqual([row.name for row in curs],
                          ['huey', 'mickey'])
 
     def _create_accounts(self, *names):
         iq = Account.insert([{Account.name: name} for name in names])
-        return iq.execute(database)
+        return iq.execute(self._db)
 
     def test_bound_select_caching(self):
         self._create_accounts('charlie', 'huey', 'zaizee')
-        BAccount = Account.bind(database)
+        BAccount = Account.bind(self._db)
         query = (BAccount
                  .select(BAccount.name.alias('account_name'))
                  .where(fn.LOWER(fn.SUBSTR(BAccount.name, 1, 1)) << ['c', 'z'])
@@ -1338,7 +1330,7 @@ class TestQueryExecution(BaseTestCase):
                                  ['charlie'])
 
     def test_bound_table(self):
-        BAccount = Account.bind(database)
+        BAccount = Account.bind(self._db)
         self.assertEqual(BAccount.insert([
             {BAccount.name: 'charlie'},
             {BAccount.name: 'huey'},
