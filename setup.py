@@ -12,6 +12,8 @@ python_source = 'sweepea.pyx'
 extension = Extension(
     'sweepea',
     define_macros=[('MODULE_NAME', '"sweepea"')],
+    #extra_compile_args=['-g', '-O0'],
+    #extra_link_args=['-g'],
     libraries=['sqlite3'],
     sources=[python_source])
 

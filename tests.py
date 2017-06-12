@@ -240,7 +240,7 @@ class BaseDatabaseTestCase(BaseTestCase):
 
     def setUp(self):
         super(BaseDatabaseTestCase, self).setUp()
-        self._db = Database(self.__db_filename__)
+        self._db = Database(self.__db_filename__, rank_functions=True)
         self._db.connect()
 
     def tearDown(self):
@@ -1353,6 +1353,63 @@ class TestQueryExecution(BaseDatabaseTestCase):
         self.assertEqual(list(rows), [
             {'name': 'huey-cat'},
             {'name': 'zaizee-cat'}])
+
+
+FNote = Table('note', ('id', 'content'))
+FNoteIdx = Table('note_idx', ('docid', 'content'))
+
+
+class TestRankFunctions(BaseDatabaseTestCase):
+    data = (
+        ('A faith is a necessity to a man. Woe to him who believes in '
+         'nothing.'),
+        ('All who call on God in true faith, earnestly from the heart, will '
+         'certainly be heard, and will receive what they have asked and '
+         'desired.'),
+        ('Be faithful in small things because it is in them that your '
+         'strength lies.'),
+        ('Faith consists in believing when it is beyond the power of reason '
+         'to believe.'),
+        ('Faith has to do with things that are not seen and hope with things '
+         'that are not at hand.'))
+
+    def setUp(self):
+        super(TestRankFunctions, self).setUp()
+
+        self.execute('CREATE TABLE note (id INTEGER NOT NULL PRIMARY KEY, '
+                     'content TEXT NOT NULL)')
+        self.execute('CREATE VIRTUAL TABLE note_idx USING FTS4 '
+                     '(content, tokenize=porter)')
+
+        for content in self.data:
+            note_id = FNote.insert({Note.content: content}).execute(self._db)
+            FNoteIdx.insert({
+                FNoteIdx.docid: note_id,
+                FNoteIdx.content: content}).execute(self._db)
+
+    def assertNotes(self, query, indexes):
+        self.assertEqual([obj.content for obj in query],
+                         [self.data[idx] for idx in indexes])
+
+    def test_rank(self):
+        query = (FNoteIdx
+                 .select()
+                 .where(FNoteIdx.match('believe'))
+                 .order_by(FNoteIdx.docid)
+                 .namedtuples()
+                 .execute(self._db))
+        self.assertNotes(query, [0, 3])
+
+        rank = FNoteIdx.rank()
+        query = (FNoteIdx
+                 .select(FNoteIdx.content, rank.alias('score'))
+                 .where(FNoteIdx.match('things'))
+                 .order_by(rank)
+                 .namedtuples()
+                 .execute(self._db))
+        self.assertEqual([(row.content, row.score) for row in query], [
+            (self.data[4], -2. / 3),
+            (self.data[2], -1. / 3)])
 
 
 if __name__ == '__main__':

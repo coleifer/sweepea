@@ -3,7 +3,7 @@ from cpython.mem cimport PyMem_Free
 from cpython.object cimport PyObject
 from cpython.ref cimport Py_INCREF, Py_DECREF
 from libc.float cimport DBL_MAX
-from libc.math cimport log
+from libc.math cimport log, sqrt
 from libc.stdlib cimport free, malloc, rand
 from libc.string cimport memcpy, memset
 
@@ -629,36 +629,35 @@ class TableFunction(object):
         return ', '.join(accum)
 
 
-cdef list _parse_match_info(object buf):
-    # See http://sqlite.org/fts3.html#matchinfo
-    cdef:
-        int bufsize = len(buf), i
-
-    bufsize = len(buf)  # Length in bytes.
-    return [struct.unpack('@I', buf[i:i+4])[0] for i in range(0, bufsize, 4)]
-
-
-cdef float rank(object raw_match_info):
+def rank(object raw_match_info):
     # Ranking implementation, which parse matchinfo.
     cdef:
-        float score = 0.0
-        int p, c, phrase_num, col_num, col_idx, x1, x2
-        list match_info
+        unsigned int *match_info
+        unsigned int *phrase_info
+        bytes _match_info_buf = bytes(raw_match_info)
+        char *match_info_buf = _match_info_buf
+        int ncol, nphrase, icol, iphrase, hits, global_hits
+        int P_O = 0, C_O = 1, X_O = 2
+        double score = 0.0
+
     # Handle match_info called w/default args 'pcx' - based on the example rank
     # function http://sqlite.org/fts3.html#appendix_a
-    match_info = _parse_match_info(raw_match_info)
-    p, c = match_info[:2]
-    for phrase_num in range(p):
-        phrase_info_idx = 2 + (phrase_num * c * 3)
-        for col_num in range(c):
-            col_idx = phrase_info_idx + (col_num * 3)
-            x1, x2 = match_info[col_idx:col_idx + 2]
-            if x1 > 0:
-                score += float(x1) / x2
+    match_info = <unsigned int *>match_info_buf
+    nphrase = match_info[P_O]
+    ncol = match_info[C_O]
+
+    for iphrase in range(nphrase):
+        phrase_info = &match_info[X_O + iphrase * ncol * 3]
+        for icol in range(ncol):
+            hits = phrase_info[3 * icol]
+            global_hits = phrase_info[3 * icol + 1]
+            if hits > 0:
+                score += (<double>hits / <double>global_hits)
+
     return -score
 
 
-cdef float bm25(object raw_match_info, int column_index):
+def bm25(object raw_match_info):
     """
     Okapi BM25 ranking implementation (FTS4 only).
 
@@ -667,18 +666,30 @@ cdef float bm25(object raw_match_info, int column_index):
       the table being queries.
     """
     cdef:
-        float avg_length, doc_length, D, term_freq, term_matches, idf
-        float denom, rhs, score
-        float k1 = 1.2
-        float b = 0.75
-        int p, c, n_idx, a_idx, l_idx, n
-        int total_docs, x_idx
-        list match_info, a, l
+        unsigned int *match_info
+        unsigned int *phrase_info
+        bytes _match_info_buf = bytes(raw_match_info)
+        char *match_info_buf = _match_info_buf
+        int icol, ncol, iphrase, nphrase
+        double B = 0.75, K = 1.2, D
+        double total_docs, term_frequency,
+        double doc_length, docs_with_term, avg_length
+        double idf, rhs, denom
+        int P_O = 0, C_O = 1, N_O = 2, A_O = 3, L_O, X_O
+        int x
 
-    match_info = _parse_match_info(raw_match_info)
-    score = 0.0
-    # p, 1 --> num terms
-    # c, 1 --> num cols
+        double score = 0.0
+
+    match_info = <unsigned int *>match_info_buf
+    nphrase = match_info[P_O]
+    ncol = match_info[C_O]
+    total_docs = match_info[N_O]
+
+    L_O = A_O + ncol
+    X_O = L_O + ncol
+
+    # p, 1 --> nphrase
+    # c, 1 --> ncol
     # x, (3 * p * c) --> for each phrase/column,
     #     term_freq for this column
     #     term_freq for all columns
@@ -687,48 +698,71 @@ cdef float bm25(object raw_match_info, int column_index):
     # a, c --> for each column, avg number of tokens in this column
     # l, c --> for each column, length of value for this column (in this row)
     # s, c --> ignore
-    p, c = match_info[:2]
-    n_idx = 2 + (3 * p * c)
-    a_idx = n_idx + 1
-    l_idx = a_idx + c
-    n = match_info[n_idx]
-    a = match_info[a_idx: a_idx + c]
-    l = match_info[l_idx: l_idx + c]
 
-    total_docs = n
-    avg_length = float(a[column_index])
-    doc_length = float(l[column_index])
-    if avg_length == 0:
-        D = 0
-    else:
-        D = 1 - b + (b * (doc_length / avg_length))
+    for iphrase in range(nphrase):
+        for icol in range(ncol):
+            avg_length = match_info[A_O + icol]
+            doc_length = match_info[L_O + icol]
+            if avg_length == 0:
+                D = 0
+            else:
+                D = 1 - B + (B * (doc_length / avg_length))
 
-    for phrase in range(p):
-        # p, c, p0c01, p0c02, p0c03, p0c11, p0c12, p0c13, p1c01, p1c02, p1c03..
-        # So if we're interested in column <i>, the counts will be at indexes
-        x_idx = 2 + (3 * column_index * (phrase + 1))
-        term_freq = float(match_info[x_idx])
-        term_matches = float(match_info[x_idx + 2])
+            x = X_O + (3 * icol * (iphrase + 1))
+            term_frequency = match_info[x]
+            docs_with_term = match_info[x + 2]
+            idf = max(
+                log(
+                    (total_docs - docs_with_term + 0.5) /
+                    (docs_with_term + 0.5)),
+                0)
+            denom = term_frequency + (K * D)
+            if denom == 0:
+                rhs = 0
+            else:
+                rhs = (term_frequency * (K + 1)) / denom
 
-        # The `max` check here is based on a suggestion in the Wikipedia
-        # article. For terms that are common to a majority of documents, the
-        # idf function can return negative values. Applying the max() here
-        # weeds out those values.
-        idf = max(
-            log(
-                (total_docs - term_matches + 0.5) /
-                (term_matches + 0.5)),
-            0)
+            score += (idf * rhs)
 
-        denom = term_freq + (k1 * D)
-        if denom == 0:
-            rhs = 0
-        else:
-            rhs = (term_freq * (k1 + 1)) / denom
+    return -1 * score
 
-        score += (idf * rhs)
 
-    return -score
+def lucene(raw_match_info):
+    # Usage: peewee_lucene(matchinfo(table, 'pcxnal'), 1)
+    cdef:
+        unsigned int *match_info
+        unsigned int *phrase_info
+        bytes _match_info_buf = bytes(raw_match_info)
+        char *match_info_buf = _match_info_buf
+        int icol, ncol, iphrase, nphrase
+        double total_docs, term_frequency,
+        double doc_length, docs_with_term, avg_length
+        double idf, weight, rhs, denom
+        int P_O = 0, C_O = 1, N_O = 2, L_O, X_O
+        int i, j, x
+
+        double score = 0.0
+
+    match_info = <unsigned int *>match_info_buf
+    nphrase = match_info[P_O]
+    ncol = match_info[C_O]
+    total_docs = match_info[N_O]
+
+    L_O = 3 + ncol
+    X_O = L_O + ncol
+
+    for iphrase in range(nphrase):
+        for icol in range(ncol):
+            doc_length = match_info[L_O + icol]
+            x = X_O + (3 * icol * (iphrase + 1))
+            term_frequency = match_info[x]
+            docs_with_term = match_info[x + 2]
+            idf = log(total_docs / (docs_with_term + 1.))
+            tf = sqrt(term_frequency)
+            fieldNorms = 1.0 / sqrt(doc_length)
+            score += (idf * tf * fieldNorms)
+
+    return -1 * score
 
 
 cdef unsigned int murmurhash2(const char *key, int nlen, unsigned int seed):
@@ -1223,19 +1257,6 @@ cdef _python_to_sqlite(sqlite3_context *context, value):
     return SQLITE_OK
 
 
-cdef void _function_callback(sqlite3_context *context, int nparams,
-                             sqlite3_value **values) with gil:
-    # C-callback used by user-defined functions implemented in Python. Note
-    # that we have to acquire the GIL because Python code is being executed.
-    # The Python function pointer itself is stored as the user-data parameter
-    # of the function when it's created.
-    cdef:
-        list params = _sqlite_to_python(context, nparams, values)
-
-    fn = <object>sqlite3_user_data(context)
-    _python_to_sqlite(context, fn(*params))
-
-
 cdef int _commit_callback(void *userData) with gil:
     # C-callback that delegates to the Python commit handler. If the Python
     # function raises a ValueError, then the commit is aborted and the
@@ -1302,7 +1323,6 @@ cdef class Database(object):
     """
     cdef:
         dict _aggregates, _collations, _functions, _modules
-        dict _function_map
         list _table_functions
         object _lock
         object _commit_hook, _rollback_hook, _update_hook
@@ -1326,11 +1346,6 @@ cdef class Database(object):
         self._functions = {}
         self._table_functions = []
 
-        # Internal function pinboard used to keep references to user-defined
-        # functions (as opposed to _functions, which holds function *and*
-        # metadata).
-        self._function_map = {}
-
         kwargs.setdefault('detect_types', pysqlite.PARSE_DECLTYPES)
         self.init(database, **kwargs)
 
@@ -1342,6 +1357,7 @@ cdef class Database(object):
         if rank_functions:
             self.func('rank')(rank)
             self.func('bm25')(bm25)
+            self.func('lucene')(lucene)
             self.aggregate('median')(median)
         if regex_function:
             self.func('regexp')(regexp)
@@ -1518,23 +1534,7 @@ cdef class Database(object):
         the advantage of allowing users to specify whether a function is non-
         deterministic (which has ramifications for indexes/query planning).
         """
-        cdef:
-            pysqlite_Connection *c_conn = <pysqlite_Connection *>conn
-            int flags = SQLITE_UTF8
-            int rc
-
-        _check_connection(c_conn)
-        if deterministic:
-            flags |= SQLITE_DETERMINISTIC
-
-        rc = sqlite3_create_function(c_conn.db, <const char *>name, nparams,
-                                     flags, <void *>fn, _function_callback,
-                                     NULL, NULL)
-
-        if rc != SQLITE_OK:
-            raise ValueError('Error calling sqlite3_create_function.')
-        else:
-            self._function_map[fn] = name
+        conn.create_function(name, nparams, fn)
 
     def func(self, name=None, n=-1, deterministic=True):
         """
@@ -2394,6 +2394,15 @@ class Table(BaseTable):
 
         return self.select().where(reduce(operator.and_, accum))
 
+    def rank(self):
+        return fn.rank(fn.matchinfo(Entity(self._name), 'pcx'))
+
+    def bm25(self):
+        return fn.bm25(fn.matchinfo(Entity(self._name), 'pcnalx'))
+
+    def match(self, rhs):
+        return Expression(Entity(self._name), 'MATCH', rhs)
+
     def __sql__(self, Context ctx):
         if not self._alias:
             return ctx.sql(Entity(*self._path))
@@ -2549,6 +2558,8 @@ class ColumnBase(Node):
         return Expression(self, 'REGEXP', expression)
     def concat(self, rhs):
         return StringExpression(self, '||', rhs)
+    def match(self, rhs):
+        return Expression(self, 'MATCH', rhs)
 
 
 class Column(ColumnBase):
@@ -3316,3 +3327,4 @@ pysqlite.register_adapter(datetime.time, str)
 pysqlite.register_converter('DATETIME', format_datetime)
 pysqlite.register_converter('DATE', format_date)
 pysqlite.register_converter('TIME', format_time)
+pysqlite.register_converter('DECIMAL', decimal.Decimal)
