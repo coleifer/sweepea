@@ -1334,7 +1334,7 @@ cdef class Database(object):
 
     def __init__(self, database, pragmas=None, journal_mode=None,
                  rank_functions=False, regex_function=True,
-                 hash_functions=True, **kwargs):
+                 hash_functions=False, **kwargs):
         self.database = database
         self.connect_kwargs = {}
         self._local = ConnectionLocal()

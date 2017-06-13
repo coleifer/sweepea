@@ -240,7 +240,8 @@ class BaseDatabaseTestCase(BaseTestCase):
 
     def setUp(self):
         super(BaseDatabaseTestCase, self).setUp()
-        self._db = Database(self.__db_filename__, rank_functions=True)
+        self._db = Database(self.__db_filename__, rank_functions=True,
+                            hash_functions=True)
         self._db.connect()
 
     def tearDown(self):
@@ -1410,6 +1411,54 @@ class TestRankFunctions(BaseDatabaseTestCase):
         self.assertEqual([(row.content, row.score) for row in query], [
             (self.data[4], -2. / 3),
             (self.data[2], -1. / 3)])
+
+    def test_bm25(self):
+        rank = FNoteIdx.bm25()
+        query = (FNoteIdx
+                 .select(FNoteIdx.content, rank.alias('score'))
+                 .where(FNoteIdx.match('things'))
+                 .order_by(rank)
+                 .namedtuples()
+                 .execute(self._db))
+        self.assertEqual([(r.content, round(r.score, 2)) for r in query], [
+            (self.data[4], -0.45),
+            (self.data[2], -0.36)])
+
+        # All phrases contain the phrase "Faith" so the results are
+        # indeterminate.
+        query = (FNoteIdx
+                 .select(FNoteIdx.content, rank.alias('score'))
+                 .where(FNoteIdx.match('faith'))
+                 .order_by(rank)
+                 .namedtuples()
+                 .execute(self._db))
+        self.assertEqual([round(row.score) for row in query],
+                         [0., 0., 0., 0., 0.])
+
+
+HUser = Table('users', ('id', 'username'))
+
+
+class TestHashFunctions(BaseDatabaseTestCase):
+    def setUp(self):
+        super(TestHashFunctions, self).setUp()
+        self.execute('create table users (id integer not null primary key, '
+                     'username text not null)')
+
+    def test_md5(self):
+        for username in ('charlie', 'huey', 'zaizee'):
+            HUser.insert({HUser.username: username}).execute(self._db)
+
+        query = (HUser
+                 .select(HUser.username,
+                         fn.SUBSTR(fn.SHA1(HUser.username), 1, 6).alias('sha'))
+                 .order_by(HUser.username)
+                 .execute(self._db))
+
+        self.assertEqual(query[:], [
+            ('charlie', 'd8cd10'),
+            ('huey', '89b31a'),
+            ('zaizee', 'b4dcf9')])
 
 
 if __name__ == '__main__':
