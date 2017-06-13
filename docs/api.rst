@@ -98,6 +98,8 @@ Swee'pea's API
     should not be instantiated directly, but instead is returned when executing
     ``SELECT`` queries.
 
+    When iterated over, the cursor wrapper will yield result rows as tuples.
+
     .. py:method:: iterator()
 
         Provides an iterator over the result-set that does not cache the result
@@ -129,3 +131,88 @@ Swee'pea's API
         Returns the first column of the first row, or raise a ``DoesNotExist``
         if no rows were returned. Useful for retrieving the value of a query
         that performed an aggregation, like a ``COUNT()`` or ``SUM()``.
+
+
+.. py:class:: DictCursorWrapper
+
+    A subclass of :py:class:`CursorWrapper` that yields result rows as
+    dictionaries.
+
+
+.. py:class:: NamedTupleCursorWrapper
+
+    A subclass of :py:class:`CursorWrapper` that yields result rows as
+    named tuples.
+
+
+.. py:class:: ObjectCursorWrapper(cursor, constructor)
+
+    A subclass of :py:class:`CursorWrapper` that accepts a constructor and for
+    each result tuple, will call the constructor with the row and yield the
+    return value.
+
+    :param constructor: A callable which accepts a row of data and returns an
+        arbitrary object.
+
+
+.. py:class:: Database(database[, pragmas=None[, journal_mode=None[, rank_functions=False[, regex_function=True[, hash_functions=False[, **kwargs]]]]]])
+
+    Wrapper for managing SQLite database connections. Handles connections in a
+    thread-safe manner and provides Pythonic APIs for managing transactions,
+    executing queries, and introspecting database internals.
+
+    :param database: The filename of the SQLite database, or the string
+        ``':memory:'`` for an in-memory database. To defer the initialization
+        of the database, you can also specify ``None``.
+    :param pragmas: A list of 2-tuples describing the pragma key and value to
+        be applied when a connection is opened.
+    :param journal_mode: Journaling mode to use with SQLite database.
+    :param bool rank_functions: Whether to register user-defined functions for
+        scoring search results. For use with full-text-search extension.
+    :param bool regex_function: Whether to register a user-defined function to
+        provide support for the ``REGEXP`` operator.
+    :param bool hash_functions: Whether to register cryptographic hash
+        functions.
+    :param kwargs: Arbitrary keyword arguments passed to the ``sqlite3``
+        connection constructor.
+
+    .. py:method:: init(database, **connect_kwargs)
+
+        This method is used to initialize a deferred database. A database is
+        said to be deferred when it is instantiated with the database file as
+        ``None``. Reasons you might do this are to declare the database in one
+        place, and actually assign it to a given file elsewhere in the code
+        (e.g. for running tests).
+
+        :param database: The filename of the SQLite database, or the string
+            ``':memory:'`` for an in-memory database.
+        :param connect_kwargs: Arbitrary keyword arguments passed to the
+            ``sqlite3`` connection constructor.
+
+    .. py:method:: connect([reuse_if_open=False])
+
+        Open a connection to the SQLite database. If a connection already
+        exists for the current thread, an ``OperationalError`` will be raised.
+        Alternatively, you can specify ``reuse_if_open`` to suppress the error
+        in the event a connection is already open.
+
+        :param bool reuse_if_open: If a connection already exists, re-use it
+            rather than raising an exception.
+        :raises OperationalError:
+        :rtype bool:
+        :returns: Boolean value indicating whether a connection was opened.
+            Will always be ``True`` unless ``reuse_if_open`` was specified and
+            a connection already existed.
+
+    .. py:method:: close()
+
+        Close the current thread's connection. If no connection is currently
+        open, no exception will be raised.
+
+        :rtype bool:
+        :returns: Boolean indicating whether a connection was closed.
+
+    .. py:method:: aggregate([name=None])
+
+        Decorator for declaring and registering a user-defined aggregate
+        function.
