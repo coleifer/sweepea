@@ -387,9 +387,21 @@ Database
         Issue a PRAGMA query on the current connection. To query the status of
         a specific PRAGMA, typically only the ``key`` will be specified.
 
+        For more information, see the `SQLite PRAGMA docs <http://sqlite.org/pragma.html>`_.
+
         .. note::
             Many ``PRAGMA`` settings are exposed as properties on the
             :py:class:`Database` object.
+
+    .. py:method:: add_pragma(key, value)
+
+        Apply the specified pragma query each time a new connection is opened.
+        If a connection is currently open, the pragma will be executed.
+
+    .. py:method:: remove_pragma(key)
+
+        Remove the pragma operation specified by the given key from the list of
+        pragma queries executed on each new connection.
 
     .. py:method:: begin([lock_type=None])
 

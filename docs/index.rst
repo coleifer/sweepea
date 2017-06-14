@@ -8,13 +8,25 @@ swee'pea
 
 Fast, lightweight Python database toolkit for SQLite, built with Cython.
 
+Like it's cousin `peewee <http://docs.peewee-orm.com/>`_, ``swee'pea`` is
+comprised of a database connection abstraction and query-building / execution
+APIs. This project is a pet project of mine, so tailor expectations
+accordingly.
+
 Features:
 
+* Implemented in Cython for performance and to expose advanced features of the
+  SQLite database library.
+* Composable and consistent APIs for building queries using Python.
 * Layered APIs allow you to work as close to the database as you want.
-* `Peewee <http://docs.peewee-orm.com/en/latest/>`_-like query building syntax.
+* No magic.
+* No bullshit.
+
+Issue tracker and code are hosted on GitHub: https://github.com/coleifer/sweepea.
+
+Documentation hosted on RT**F**D: https://sweepea.readthedocs.io/
 
 .. image:: http://media.charlesleifer.com/blog/photos/sweepea-fast.png
-
 
 Contents:
 

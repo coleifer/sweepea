@@ -1581,6 +1581,14 @@ cdef class Database(object):
         if row:
             return row[0]
 
+    def add_pragma(self, key, value):
+        self._pragmas.append((key, value))
+        if not self.is_closed():
+            self.pragma(key, value)
+
+    def remove_pragma(self, key):
+        self._pragmas = [(k, v) for k, v in self._pragmas if k != key]
+
     def begin(self, lock_type=None):
         """
         Start a transaction using the specified lock type. If the lock type is
