@@ -576,23 +576,6 @@ cdef class _TableFunctionImpl(object):
 
 
 class TableFunction(object):
-    """
-    Implements a table-valued function (eponymous-only virtual table) in
-    SQLite.
-
-    Subclasses must define the columns (return values) and params (input
-    values) to their function. These are defined as class attributes.
-
-    The subclass also must implement two functions:
-
-    * initialize(**query)
-    * iterate(idx)
-
-    The `initialize` function accepts the query parameters passed in from
-    the SQL query. The `iterate` function accepts the index of the current
-    iteration (zero-based) and must return a tuple of result values or raise
-    a `StopIteration` to signal no more results.
-    """
     columns = None
     params = None
     name = None
@@ -1479,22 +1462,6 @@ cdef class Database(object):
         conn.create_aggregate(name, nparams, klass)
 
     def aggregate(self, name=None):
-        """
-        Class decorator for user-defined aggregates.
-
-        Example::
-
-            @db.aggregate('avg')
-            class Average(object):
-                def __init__(self):
-                    self.vals = []
-
-                def step(self, value):
-                    self.vals.append(value)
-
-                def finalize(self):
-                    return avg(self.vals)
-        """
         def decorator(klass):
             agg_name = name or klass.__name__
             self._aggregates[agg_name] = klass
@@ -1507,20 +1474,6 @@ cdef class Database(object):
         conn.create_collation(name, fn)
 
     def collation(self, name=None):
-        """
-        Register a custom collation.
-
-        Example::
-
-            @db.collation('numeric')
-            def numeric(lhs, rhs):
-                # Sort strings with numbers in them.
-                l1 = [int(t) if t.isdigit() else t
-                      for t in re.split('(\d+)', lhs)]
-                l2 = [int(t) if t.isdigit() else t
-                      for t in re.split('(\d+)', lhs)]
-                return cmp(l1, l2)
-        """
         def decorator(fn):
             collation_name = name or fn.__name__
             self._collations[collation_name] = fn
@@ -1529,23 +1482,9 @@ cdef class Database(object):
         return decorator
 
     cdef _create_function(self, conn, fn, name, nparams, deterministic):
-        """
-        Register a user-defined function using our own implementation. This has
-        the advantage of allowing users to specify whether a function is non-
-        deterministic (which has ramifications for indexes/query planning).
-        """
         conn.create_function(name, nparams, fn)
 
     def func(self, name=None, n=-1, deterministic=True):
-        """
-        Create a user-defined function.
-
-        Example::
-
-            @db.func('md5')
-            def md5(s):
-                return hashlib.md5(s).hexdigest()
-        """
         def decorator(fn):
             fn_name = name or fn.__name__
             self._functions[fn_name] = (fn, n, deterministic)
@@ -1556,25 +1495,6 @@ cdef class Database(object):
         return decorator
 
     def table_function(self, name=None):
-        """
-        Register a table-function with the database.
-
-        @db.table_function('series')
-        class Series(TableFunction):
-            columns = ['value']
-            params = ['start', 'stop']
-
-            def initialize(self, start=0, stop=None):
-                self.start, self.stop = start, (stop or float('Inf'))
-                self.curr = self.start
-
-            def iterate(self, idx):
-                if self.curr > self.stop:
-                    raise StopIteration
-                ret = self.curr
-                self.curr += 1
-                return (ret,)
-        """
         def decorator(klass):
             if name is not None:
                 klass.name = name
@@ -1585,18 +1505,6 @@ cdef class Database(object):
         return decorator
 
     def on_commit(self, fn):
-        """
-        Register a post-commit hook. The handler's return value is ignored,
-        but if a ValueError is raised, then the transaction will be rolled
-        back.
-
-        Example::
-
-            @db.on_commit
-            def commit_handler():
-                if datetime.date.today().weekday() == 6:
-                    raise ValueError('no commits on sunday!')
-        """
         self._commit_hook = fn
         if not self.is_closed():
             self._set_commit_hook(self.connection(), fn)
@@ -1610,9 +1518,6 @@ cdef class Database(object):
             sqlite3_commit_hook(conn.db, _commit_callback, <void *>fn)
 
     def on_rollback(self, fn):
-        """
-        Register a rollback handler. Return value is ignored.
-        """
         self._rollback_hook = fn
         if not self.is_closed():
             self._set_rollback_hook(self.connection(), fn)
@@ -1626,24 +1531,6 @@ cdef class Database(object):
             sqlite3_rollback_hook(conn.db, _rollback_callback, <void *>fn)
 
     def on_update(self, fn):
-        """
-        Register an update hook. Hook is executed for each row that is
-        inserted, updated or deleted. Return value is ignored.
-
-        User-defined callback must accept the following parameters:
-
-        * query type (INSERT, UPDATE or DELETE)
-        * database name (typically 'main')
-        * table name
-        * rowid of affected row
-
-        Example::
-
-            @db.on_update
-            def change_logger(query_type, db, table, rowid):
-                logger.debug('%s query on %s.%s row %s', query_type, db,
-                             table, rowid)
-        """
         self._update_hook = fn
         if not self.is_closed():
             self._set_update_hook(self.connection(), fn)
@@ -1657,7 +1544,6 @@ cdef class Database(object):
             sqlite3_update_hook(conn.db, _update_callback, <void *>fn)
 
     cpdef bint is_closed(self):
-        """Return a boolean indicating whether the DB is closed."""
         return self._local.closed
 
     cpdef connection(self):
@@ -1789,53 +1675,12 @@ cdef class Database(object):
         return _manual(self)
 
     cpdef _atomic atomic(self):
-        """
-        Execute statements in either a transaction or a savepoint. The
-        outer-most call to *atomic* will use a transaction, and any subsequent
-        nested calls will use savepoints.
-
-        ``atomic`` can be used as either a context manager or a decorator.
-
-        .. note::
-            For most use-cases, it makes the most sense to always use
-            ``atomic`` when you wish to execute queries in a transaction.
-            The benefit of using ``atomic`` is that you do not need to
-            manually keep track of the transaction stack depth, as this will
-            be managed for you.
-        """
         return _atomic(self)
 
     cpdef _transaction transaction(self):
-        """
-        Execute statements in a transaction using either a context manager or
-        decorator. If an error is raised inside the wrapped block, the
-        transaction will be rolled back, otherwise statements are committed
-        when exiting. Transactions can also be explicitly rolled back or
-        committed within the transaction block by calling
-        :py:meth:`~transaction.rollback` or :py:meth:`~transaction.commit`.
-        If you manually commit or roll back, a new transaction will be started
-        automatically.
-
-        Nested blocks can be wrapped with ``transaction`` - the database
-        will keep a stack and only commit when it reaches the end of the outermost
-        function / block.
-        """
         return _transaction(self)
 
     cpdef _savepoint savepoint(self):
-        """
-        Execute statements in a savepoint using either a context manager or
-        decorator. If an error is raised inside the wrapped block, the
-        savepoint will be rolled back, otherwise statements are committed when
-        exiting. Like :py:meth:`~Database.transaction`, a savepoint can also
-        be explicitly rolled-back or committed by calling
-        :py:meth:`~savepoint.rollback` or :py:meth:`~savepoint.commit`. If you
-        manually commit or roll back, a new savepoint **will not** be created.
-
-        Savepoints can be thought of as nested transactions.
-
-        :param str sid: An optional string identifier for the savepoint.
-        """
         return _savepoint(self)
 
     cpdef list get_tables(self):
