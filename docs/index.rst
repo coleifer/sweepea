@@ -22,7 +22,7 @@ Contents:
    :maxdepth: 2
    :glob:
 
-   getting-started
+   installation
    api
 
 
