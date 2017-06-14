@@ -1,13 +1,30 @@
-## sqlite-ext
+## swee'pea
 
-A collection of SQLite extensions.
+Fast, lightweight Python database toolkit for SQLite, built with Cython.
 
-* Easy-to-use query builder similar to [Peewee ORM](https://github.com/coleifer/peewee).
-* Implement completely dynamic [tables](http://sqlite.org/vtab.html#tabfunc2)
-  using Python.
-* Connection and transaction management helpers.
+Like it's cousin `peewee <http://docs.peewee-orm.com/>`_, ``swee'pea`` is
+comprised of a database connection abstraction and query-building / execution
+APIs. This project is a pet project of mine, so tailor expectations
+accordingly.
+
+Features:
+
+* Implemented in Cython for performance and to expose advanced features of the
+  SQLite database library.
+* Composable and consistent APIs for building queries using Python.
+* Layered APIs allow you to work as close to the database as you want.
+* No magic.
+* No bullshit.
+
+Issue tracker and code are hosted on GitHub: https://github.com/coleifer/sweepea.
+
+Documentation hosted on RT**F**D: https://sweepea.readthedocs.io/
+
+![](http://media.charlesleifer.com/blog/photos/sweepea-fast.png)
 
 ### Dependencies
+
+Cython.
 
 This project is designed to work with the standard library `sqlite3` driver, or
 alternatively, the latest version of `pysqlite2`.
@@ -161,6 +178,8 @@ Example of constructing a simple query:
 
 ```python
 
+db = Database('app.db')
+
 Employee = Table('employees', ('id', 'name', 'start_date', 'manager_id'))
 
 # Get list of employees and their manager's name, sorted by tenure.
@@ -173,7 +192,7 @@ query = (Employee
          .join(Manager, JOIN.LEFT_OUTER, on=(Employee.manager_id == Manager.id))
          .order_by(Employee.start_date))
 
-for row in query:
+for row in query.execute(db):
     print row['name'], row['start_date'], (row['manager_name'] or 'no mgr')
 ```
 
