@@ -155,6 +155,10 @@ Swee'pea's API
         arbitrary object.
 
 
+Database
+--------
+
+
 .. py:class:: Database(database[, pragmas=None[, journal_mode=None[, rank_functions=False[, regex_function=True[, hash_functions=False[, **kwargs]]]]]])
 
     Wrapper for managing SQLite database connections. Handles connections in a
@@ -586,7 +590,8 @@ Swee'pea's API
 
         Property that exposes ``PRAGMA wal_autocheckpoint``
 
-## SQL Builder
+SQL Builder
+-----------
 
 .. py:class:: Table(name[, columns=None[, schema=None[, alias=None]]])
 
@@ -723,4 +728,77 @@ Swee'pea's API
     .. py:method:: filter(**kwargs)
 
         Perform a :py:class:`Select` query, filtering the result set using
-        keyword arguments to represent filter expressions.
+        keyword arguments to represent filter expressions. All expressions are
+        combined using ``AND``.
+
+        This method is provided as a convenience API.
+
+        Example:
+
+        .. code-block:: python
+
+            Person = Table('person', ('id', 'name', 'dob'))
+
+            today = datetime.date.today()
+            eighteen_years_ago = today - datetime.timedelta(years=18)
+            adults = Person.filter(dob__gte=eighteen_years_ago)
+
+    .. py:method:: rank()
+
+        Convenience method for representing an expression which calculates the
+        rank of search results.
+
+        Example:
+
+        .. code-block:: python
+
+            NoteIdx = Table('note_idx', ('docid', 'content'))
+            rank = NoteIdx.rank()
+            query = (NoteIdx
+                     .select(NoteIdx.docid, NoteIdx.content, rank.alias('score'))
+                     .where(NoteIdx.match('search query'))
+                     .order_by(rank)
+                     .namedtuples())
+
+            for search_result in query.execute(database):
+                print search_result.score, search_result.content
+
+    .. py:method:: bm25()
+
+        Convenience method for representing an expression which calculates the
+        rank of search results using the BM25 algorithm. Usage is identical to
+        :py:meth:`~Table.rank`.
+
+    .. py:method:: match(search_term)
+
+        Convenience method for generating an expression that corresponds to a
+        search on a full-text search virtual table. For an example of usage,
+        see :py:meth:`~Table.rank`.
+
+
+.. py:class:: BoundTable(database, name[, columns=None[, schema=None[, alias=None]]])
+
+    Identical to :py:class:`Table` with the exception that any queries on the
+    table will automatically be bound to the provided database.
+
+    With an ordinary :py:class:`Table` object, you would write the following:
+
+    .. code-block:: python
+
+        User = Table('users', ('id', 'username'))
+        query = User.select().namedtuples()
+        for user in query.execute(database):
+            print user.username
+
+    With a bound table, you can instead write:
+
+    .. code-block:: python
+
+        BoundUser = User.bind(database)
+        query = User.select().namedtuples()
+        for user in query.execute():
+            print user.username
+
+        # Or, even simpler, since bound select queries implement __iter__:
+        for user in query:
+            print user.username
