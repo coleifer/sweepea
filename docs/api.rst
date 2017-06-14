@@ -590,4 +590,137 @@ Swee'pea's API
 
 .. py:class:: Table(name[, columns=None[, schema=None[, alias=None]]])
 
-    Represents a table in a SQL query.
+    Represents a table in a SQL query. Tables can be initialized with a static
+    list of columns, or columns can be referenced dynamically using the ``c``
+    attribute.
+
+    Example:
+
+    .. code-block:: python
+
+        # Example using a static list of columns:
+        UserTbl = Table('users', ('id', 'username'))
+        query = (UserTbl
+                 .select()  # "id" and "username" automatically selected.
+                 .order_by(UserTbl.username))
+
+        # Using dynamic columns:
+        TweetTbl = Table('tweets')
+        query = (TweetTbl
+                 .select(TweetTbl.c.content, TweetTbl.c.timestamp)
+                 .join(UserTbl, on=(TweetTbl.c.user_id == UserTbl.id))
+                 .where(UserTbl.username == 'charlie')
+                 .order_by(TweetTbl.c.timestamp.desc()))
+
+    .. py:method:: bind(database)
+
+        Create a table reference that is bound to the given database. Returns
+        a :py:class:`BoundTable` instance.
+
+    .. py:method:: select(*selection)
+
+        Create a :py:class:`Select` query from the given table. If the
+        ``selection`` is not provided, and the table defines a static list of
+        columns, then the selection will default to all defined columns.
+
+        :param selection: values to select.
+        :returns: a :py:class:`Select` query instance.
+
+    .. py:method:: insert([data=None[, columns=None[, on_conflict=None[, **kwargs]]]])
+
+        Create a :py:class:`Insert` query into the given table. Data to be
+        inserted can be provided in a number of different formats:
+
+        * a dictionary of table columns to values
+        * keyword arguments of column names to values
+        * a list/tuple/iterable of dictionaries
+        * a :py:class:`Select` query instance.
+
+        .. note::
+            When providing a :py:class:`Select` query, it is necessary to also
+            provide a list of columns.
+
+            It is also advisable to provide a list of columns when supplying a
+            list or iterable of rows to insert.
+
+        Simple insert example:
+
+        .. code-block:: python
+
+            User = Table('users', ('id', 'username', 'is_admin'))
+
+            # Simple inserts.
+            query = User.insert({User.username: 'huey', User.is_admin: False})
+
+            # Equivalent to above.
+            query = User.insert(username='huey', is_admin=False)
+
+        Inserting multiple rows:
+
+        .. code-block:: python
+
+            # Inserting multiple rows of data.
+            data = (
+                {User.username: 'huey', User.is_admin: False},
+                {User.username: 'mickey', User.is_admin: True})
+            query = User.insert(data)
+
+            # Equivalent to above
+            query = User.insert(data, columns=(User.username, User.is_admin))
+
+        Inserting using a SELECT query:
+
+        .. code-block:: python
+
+            Person = Table('person', ('id', 'name'))
+
+            query = User.insert(
+                Person.select(Person.name, False),
+                columns=(User.username, User.is_admin))
+
+            # Results in:
+            # INSERT INTO "users" ("username", "is_admin")
+            # SELECT "person"."name", false FROM "person";
+
+    .. py:method:: update([data=None[, on_conflict=None[, **kwargs]]])
+
+        Create a :py:class:`Update` query for the given table. Update can be
+        provided as a dictionary keyed by column, or using keyword arguments.
+
+        Examples:
+
+        .. code-block:: python
+
+            User = Table('users', ('id', 'username', 'is_admin'))
+
+            query = (User
+                     .update({User.is_admin: False})
+                     .where(User.username == 'huey'))
+
+            # Equivalent to above:
+            query = User.update(is_admin=False).where(User.username == 'huey')
+
+        Example of an atomic update:
+
+        .. code-block:: python
+
+            PageView = Table('pageviews', ('url', 'view_count'))
+
+            query = (PageView
+                     .update({PageView.view_count: PageView.view_count + 1})
+                     .where(PageView.url == some_url))
+
+    .. py:method:: delete()
+
+        Create a :py:class:`Delete` query for the given table.
+
+        Example:
+
+        .. code-block:: python
+
+            query = User.delete().where(User.c.account_expired == True)
+
+    .. py:method:: filter(**kwargs)
+
+        Perform a :py:class:`Select` query, filtering the result set using
+        keyword arguments to represent filter expressions.

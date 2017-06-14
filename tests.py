@@ -1062,12 +1062,22 @@ class TestInsertQuery(BaseTestCase):
             'INSERT INTO "users" ("admin", "superuser", "username") '
             'VALUES (?, ?, ?)'), [True, False, 'charlie'])
 
+        query = User.insert(username='charlie', superuser=False)
+        self.assertSQL(query, (
+            'INSERT INTO "users" ("superuser", "username") VALUES (?, ?)'),
+            (False, 'charlie'))
+
     def test_insert_list(self):
         data = [
             {Person.name: 'charlie'},
             {Person.name: 'huey'},
             {Person.name: 'zaizee'}]
         query = Person.insert(data)
+        self.assertSQL(query, (
+            'INSERT INTO "person" ("name") VALUES (?), (?), (?)'),
+            ['charlie', 'huey', 'zaizee'])
+
+        query = Person.insert(data, columns=(Person.name,))
         self.assertSQL(query, (
             'INSERT INTO "person" ("name") VALUES (?), (?), (?)'),
             ['charlie', 'huey', 'zaizee'])
@@ -1079,6 +1089,12 @@ class TestInsertQuery(BaseTestCase):
             'INSERT INTO "person" ("name") '
             'SELECT "users"."username" FROM "users" '
             'WHERE ("users"."admin" = ?)'), [False])
+
+        source = Person.select(Person.name, False)
+        query = User.insert(source, columns=(User.c.username, User.c.is_admin))
+        self.assertSQL(query, (
+            'INSERT INTO "users" ("username", "is_admin") '
+            'SELECT "person"."name", ? FROM "person"'), [False])
 
     def test_insert_query_cte(self):
         cte = User.select(User.c.username).cte('foo')
@@ -1103,6 +1119,13 @@ class TestUpdateQuery(BaseTestCase):
             'UPDATE "users" SET '
             '"counter" = ("counter" + ?) '
             'WHERE ("username" = ?)'), [1, 'nugz'])
+
+        query = (User
+                 .update(is_admin=False)
+                 .where(User.c.is_admin == True))
+        self.assertSQL(query, (
+            'UPDATE "users" SET "is_admin" = ? WHERE ("is_admin" = ?)'),
+            [False, True])
 
     def test_update_multi_set(self):
         Stat = Table('stat', ('id', 'key', 'counter'))

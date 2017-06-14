@@ -2360,13 +2360,19 @@ class Table(BaseTable):
             selection = [Column(self, column) for column in self._columns]
         return Select((self,), selection)
 
-    def insert(self, data=None, **kwargs):
-        # TODO: normalize
-        return Insert(self, data, **kwargs)
+    def insert(self, data=None, columns=None, on_conflict=None, **kwargs):
+        if kwargs:
+            data = data or {}
+            for key, value in kwargs.items():
+                data[Column(self, key)] = value
+        return Insert(self, data, columns=columns, on_conflict=on_conflict)
 
-    def update(self, data=None, **kwargs):
-        # TODO: normalize
-        return Update(self, data)
+    def update(self, data=None, on_conflict=None, **kwargs):
+        if kwargs:
+            data = data or {}
+            for key, value in kwargs.items():
+                data[Column(self, key)] = value
+        return Update(self, data, on_conflict=on_conflict)
 
     def delete(self):
         return Delete(self)
