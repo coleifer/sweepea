@@ -53,15 +53,15 @@ Swee'pea's API
 
         # Prints 0, 2, 4, 6, 8, 10.
 
-    .. py:attr:: columns
+    .. py:attribute:: columns
 
         A list or tuple describing the rows returned by this function.
 
-    .. py:attr:: params
+    .. py:attribute:: params
 
         A list or tuple describing the parameters this function accepts.
 
-    .. py:attr:: name
+    .. py:attribute:: name
 
         The name of the table-valued function. If not provided, name will be
         inferred from the class name.
@@ -216,3 +216,378 @@ Swee'pea's API
 
         Decorator for declaring and registering a user-defined aggregate
         function.
+
+        Example:
+
+        .. code-block:: python
+
+            @db.aggregate('avg')
+            class Average(object):
+                def __init__(self):
+                    self.vals = []
+
+                def step(self, value):
+                    self.vals.append(value)
+
+                def finalize(self):
+                    return sum(self.vals) / len(self.vals)
+
+    .. py: method:: collation([name=None])
+
+        Decorator for declaring and registering a user-defined collation.
+        Collations define the ordering for a set of values.
+
+        Example:
+
+        .. code-block:: python
+
+            @db.collation('numeric')
+            def numeric(lhs, rhs):
+                # Sort strings with numbers in them.
+                l1 = [int(t) if t.isdigit() else t
+                      for t in re.split('(\d+)', lhs)]
+                l2 = [int(t) if t.isdigit() else t
+                      for t in re.split('(\d+)', lhs)]
+                return cmp(l1, l2)
+
+    .. py:method:: func([name=None[, n=-1[, deterministic=True]]])
+
+        Decorator for declaring and registering a user-defined function.
+        User-defined functions accept up to ``n`` parameters and return a
+        scalar value. If ``n`` is not fixed, you may specify ``-1``.
+
+        :param str name: Name of the function.
+        :param int n: Number of parameters function accepts, or ``-1``.
+        :param bool deterministic: Function is deterministic.
+
+        Example:
+
+        .. code-block:: python
+
+            @db.func('md5')
+            def md5(s):
+                return hashlib.md5(s).hexdigest()
+
+    .. py:method:: table_function([name=None])
+
+        Decorator for declaring and registering a table-valued function with
+        the database. Table-valued functions are described in the section on
+        :py:class:`TableFunction`, but briefly, a table-valued function accepts
+        any number of parameters, and instead of returning a scalar value,
+        returns any number of rows of tabular data.
+
+        Example:
+
+        .. code-block:: python
+
+            @db.table_function('series')
+            class Series(TableFunction):
+                columns = ['value']
+                params = ['start', 'stop']
+
+                def initialize(self, start=0, stop=None):
+                    self.start, self.stop = start, (stop or float('Inf'))
+                    self.current = self.start
+
+                def iterate(self, idx):
+                    if self.current > self.stop:
+                        raise StopIteration
+                    ret = self.current
+                    self.current += 1
+                    return (ret,)
+
+    .. py:method:: on_commit(func)
+
+        Decorator for declaring and registering a post-commit hook. The
+        handler's return value is ignored, but if a ``ValueError`` is raised,
+        then the transaction will be rolled-back.
+
+        The decorated function should not accept any parameters.
+
+        Example:
+
+        .. code-block:: python
+
+            @db.on_commit
+            def commit_handler():
+                if datetime.date.today().weekday() == 6:
+                    raise ValueError('no commits on sunday!')
+
+    .. py:method:: on_rollback(func)
+
+        Decorator for registering a rollback handler. The return value is
+        ignored.
+
+        The decorated function should not accept any parameters.
+
+        Example:
+
+        .. code-block:: python
+
+            @db.on_rollback
+            def rollback_handler():
+                logger.info('rollback was issued.')
+
+    .. py:method:: on_update(func)
+
+        Decorator for registering an update hook. The decorated function is
+        executed for each row that is inserted, updated or deleted. The return
+        value is ignored.
+
+        User-defined callback must accept the following parameters:
+
+        * query type (INSERT, UPDATE or DELETE)
+        * database name (typically 'main')
+        * table name
+        * rowid of affected row
+
+        Example:
+
+        .. code-block:: python
+
+            @db.on_update
+            def change_logger(query_type, db, table, rowid):
+                logger.debug('%s query on %s.%s row %s', query_type, db,
+                             table, rowid)
+
+    .. py:method:: is_closed()
+
+        Return a boolean indicating whether the database is closed.
+
+    .. py:method:: connection()
+
+        Get the currently open connection. If the database is closed, then a
+        new connection will be opened and returned.
+
+    .. py:method:: execute_sql(sql[, params=None[, commit=True]])
+
+        Execute the given SQL query and returns the cursor. If no connection is
+        currently open, one will be opened automatically.
+
+        :param sql: SQL query
+        :param params: A list or tuple of parameters for the query.
+        :param bool commit: Whether a ``commit`` should be invoked after the
+            query is executed.
+        :returns: A ``sqlite3.Cursor`` instance.
+
+    .. py:method:: execute(query)
+
+        Execute the SQL query represented by the :py:class:`Query` object. The
+        query will be parsed into a parameterized SQL query automatically.
+
+        :param Query query: The :py:class:`Query` instance to execute.
+        :returns: A ``sqlite3.Cursor`` instance.
+
+    .. py:method:: pragma(key[, value=SENTINEL])
+
+        Issue a PRAGMA query on the current connection. To query the status of
+        a specific PRAGMA, typically only the ``key`` will be specified.
+
+        .. note::
+            Many ``PRAGMA`` settings are exposed as properties on the
+            :py:class:`Database` object.
+
+    .. py:method:: begin([lock_type=None])
+
+        Start a transaction using the specified lock type. If the lock type is
+        unspecified, then a bare ``BEGIN`` statement is issued.
+
+        Because swee'pea runs ``sqlite3`` in autocommit mode, it is necessary
+        to explicitly begin transactions using this method.
+
+        For an alternative API, see the :py:meth:`~Database.atomic` helper.
+
+    .. py:method:: commit()
+
+        Call ``commit()`` on the currently-open ``sqlite3.Connection`` object.
+
+    .. py:method:: rollback()
+
+        Call ``rollback()`` on the currently-open ``sqlite3.Connection`` object.
+
+    .. py:method:: __getitem__(name)
+
+        Factory method for creating :py:class:`BoundTable` instances.
+
+        Example:
+
+        .. code-block:: python
+
+            UserTbl = db['users']
+            query = UserTbl.select(UserTbl.c.username)
+            for username, in query.execute():
+                print username
+
+    .. py:method:: __enter__()
+
+        Use the database as a context-manager. When the context manager is
+        entered, a connection is opened (if one is not already open) and a
+        transaction begins. When the context manager exits, the transaction is
+        either committed or rolled-back (depending on whether the context
+        manager exits with an exception). Finally, the connection is closed.
+
+        Example:
+
+        .. code-block:: python
+
+            with database:
+                database.execute_sql('CREATE TABLE foo (data TEXT)')
+                FooTbl = database['foo']
+                for i in range(10):
+                    FooTbl.insert({FooTbl.c.data: str(i)}).execute()
+
+    .. py:method:: last_insert_rowid()
+
+        Return the ``rowid`` of the most-recently-inserted row on the currently
+        active connection.
+
+    .. py:method:: changes()
+
+        Return the number of rows changed by the most recent query.
+
+    .. py:attribute:: autocommit
+
+        A property which indicates whether the connection is in autocommit mode
+        or not.
+
+    .. py:method:: set_busy_handler([timeout=5000])
+
+        Replace the default SQLite busy handler with one that introduces some
+        *jitter* into the amount of time delayed between checks. This addresses
+        an issue that frequently occurs when multiple threads are attempting to
+        modify data at nearly the same time.
+
+        :param timeout: Max number of milliseconds to attempt to execute query.
+
+    .. py:method:: atomic()
+
+        Context manager or decorator that executes the wrapped statements in
+        either a transaction or a savepoint. The outer-most call to ``atomic``
+        will use a transaction, and any subsequent nested calls will use
+        savepoints.
+
+        .. note::
+            For most use-cases, it makes the most sense to always use
+            ``atomic`` when you wish to execute queries in a transaction.
+            The benefit of using ``atomic`` is that you do not need to
+            manually keep track of the transaction stack depth, as this will
+            be managed for you.
+
+    .. py:method:: transaction()
+
+        Execute statements in a transaction using either a context manager or
+        decorator. If an error is raised inside the wrapped block, the
+        transaction will be rolled back, otherwise statements are committed
+        when exiting. Transactions can also be explicitly rolled back or
+        committed within the transaction block by calling
+        :py:meth:`~transaction.rollback` or :py:meth:`~transaction.commit`.
+        If you manually commit or roll back, a new transaction will be started
+        automatically.
+
+        Nested blocks can be wrapped with ``transaction`` - the database
+        will keep a stack and only commit when it reaches the end of the outermost
+        function / block.
+
+    .. py:method:: savepoint()
+
+        Execute statements in a savepoint using either a context manager or
+        decorator. If an error is raised inside the wrapped block, the
+        savepoint will be rolled back, otherwise statements are committed when
+        exiting. Like :py:meth:`~Database.transaction`, a savepoint can also
+        be explicitly rolled-back or committed by calling
+        :py:meth:`~savepoint.rollback` or :py:meth:`~savepoint.commit`. If you
+        manually commit or roll back, a new savepoint **will not** be created.
+
+        Savepoints can be thought of as nested transactions.
+
+        :param str sid: An optional string identifier for the savepoint.
+
+    .. py:method:: get_tables()
+
+        Return a sorted list of the tables in the database.
+
+    .. py:method:: get_indexes(table)
+
+        Returns a list of index metadata for the given table. The index
+        metadata is returned as a 4-tuple consisting of:
+
+        * Index name.
+        * SQL used to create the index.
+        * Names of columns being indexed.
+        * Whether the index is unique.
+
+    .. py:method:: get_columns(table)
+
+        Returns a list of column metadata for the given table. Column
+        metadata is returned as a 4-tuple consisting of:
+
+        * Column name.
+        * Data-type column was declared with.
+        * Whether the column can be NULL.
+        * Whether the column is the primary key.
+
+    .. py:method:: get_primary_keys(table)
+
+        Returns a list of column(s) that comprise the table's primary key.
+
+    .. py:method:: get_foreign_keys(table)
+
+        Returns a list of foreign key metadata for the given table. Foreign
+        key metadata is returned as a 3-tuple consisting of:
+
+        * Source column name, i.e. the column on the given table.
+        * Destination table.
+        * Destination column.
+
+    .. py:method:: backup(dest_db)
+
+        Backup the current database to the given destination
+        :py:class:`Database` instance.
+
+        :param Database dest_db: database to hold backup.
+
+    .. py:method:: backup_to_file(filename)
+
+        Backup the current database to the given filename.
+
+    .. py:attribute:: cache_size
+
+        Property that exposes ``PRAGMA cache_size``.
+
+    .. py:attribute:: foreign_keys
+
+        Property that exposes ``PRAGMA foreign_keys``.
+
+    .. py:attribute:: journal_mode
+
+        Property that exposes ``PRAGMA journal_mode``.
+
+    .. py:attribute:: journal_size_limit
+
+        Property that exposes ``PRAGMA journal_size_limit``.
+
+    .. py:attribute:: mmap_size
+
+        Property that exposes ``PRAGMA mmap_size``.
+
+    .. py:attribute:: page_size
+
+        Property that exposes ``PRAGMA page_size``
+
+    .. py:attribute:: read_uncommited
+
+        Property that exposes ``PRAGMA read_uncommited``
+
+    .. py:attribute:: synchronous
+
+        Property that exposes ``PRAGMA synchronous``
+
+    .. py:attribute:: wal_autocheckpoint
+
+        Property that exposes ``PRAGMA wal_autocheckpoint``
+
+## SQL Builder
+
+.. py:class:: Table(name[, columns=None[, schema=None[, alias=None]]])
+
+    Represents a table in a SQL query.

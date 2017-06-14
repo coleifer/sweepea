@@ -20,7 +20,9 @@ Contents:
 
 .. toctree::
    :maxdepth: 2
+   :glob:
 
+   api
 
 
 Indices and tables
