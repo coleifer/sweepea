@@ -1009,7 +1009,7 @@ cdef class CursorWrapper(object):
             return self.result_cache[item]
         elif isinstance(item, int):
             fill_line = item + 1 if item >= 0 else item
-            self.fill_cache(fill_line if item > 0 else 0)
+            self.fill_cache(fill_line)
             return self.result_cache[item]
         else:
             raise ValueError('CursorWrapper only supports integer and slice '
@@ -1051,8 +1051,8 @@ cdef class CursorWrapper(object):
     cpdef fill_cache(self, n=None):
         cdef:
             int counter = -1 if n is None else <int>n
+            ResultIterator iterator = ResultIterator(self)
 
-        iterator = ResultIterator(self)
         iterator.index = self.count
         while not self.is_populated and (counter < 0 or counter > self.count):
             try:

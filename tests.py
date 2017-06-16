@@ -1310,6 +1310,17 @@ class TestQueryExecution(BaseDatabaseTestCase):
         rows = [r for r, in cw]
         self.assertEqual(rows, ['charlie', 'huey', 'mickey', 'zaizee'])
 
+    def test_indexing_query(self):
+        self._create_people()
+        with self.assertQueryCount(1):
+            query = Account.select().order_by(Account.name).namedtuples()
+            cursor_wrapper = query.execute(self._db)
+            self.assertEqual(cursor_wrapper[0].name, 'charlie')
+            self.assertEqual(cursor_wrapper[3].name, 'zaizee')
+            self.assertEqual([x.name for x in cursor_wrapper[1:3]],
+                             ['huey', 'mickey'])
+            self.assertRaises(IndexError, lambda: cursor_wrapper[4])
+
     def test_builtin_functions(self):
         self._create_people()
         query = (Account
