@@ -3090,16 +3090,25 @@ class BoundSelect(_BoundQuery, Select):
         clone._cursor = None
         return clone
 
-    def __iter__(self):
+    def execute(self):
         if self._cursor is None:
-            self._cursor = self.execute()
-        return iter(self._cursor)
+            self._cursor = super(BoundSelect, self).execute()
+        return self._cursor
+
+    def __iter__(self):
+        return iter(self.execute())
 
     def __getitem__(self, item):
         return self.execute()[item]
 
+    def first(self):
+        return self.execute().first()
+
     def get(self):
         return self.execute().get()
+
+    def scalar(self):
+        return self.execute().scalar()
 
 
 class BoundUpdate(_BoundQuery, Update): pass

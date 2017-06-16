@@ -1297,19 +1297,21 @@ class TestQueryExecution(BaseDatabaseTestCase):
             ('mickey', '4d5257'),
             ('zaizee', '7670f7')])
 
-    def test_cursor_iteration(self):
+    def test_multiple_iteration_result_caching(self):
         self._create_people()
-        query = Account.select(Account.name).order_by(Account.name)
-        cw = query.execute(self._db)
-        rows = [r for r in cw]
 
-        self.assertEqual(cw[1], ('huey',))
-        self.assertEqual(cw[2], ('mickey',))
-        self.assertEqual(cw[:2], [('charlie',), ('huey',)])
-        self.assertEqual(cw[-1], ('zaizee',))
+        with self.assertQueryCount(1):
+            query = Account.select(Account.name).order_by(Account.name)
+            cw = query.execute(self._db)
+            rows = [r for r in cw]
 
-        rows = [r for r, in cw]
-        self.assertEqual(rows, ['charlie', 'huey', 'mickey', 'zaizee'])
+            self.assertEqual(cw[1], ('huey',))
+            self.assertEqual(cw[2], ('mickey',))
+            self.assertEqual(cw[:2], [('charlie',), ('huey',)])
+            self.assertEqual(cw[-1], ('zaizee',))
+
+            rows = [r for r, in cw]
+            self.assertEqual(rows, ['charlie', 'huey', 'mickey', 'zaizee'])
 
     def test_indexing_query(self):
         self._create_people()
@@ -1367,6 +1369,18 @@ class TestQueryExecution(BaseDatabaseTestCase):
         self.assertRaises(DoesNotExist,
                           BAccount.select().where(BAccount.name == 'x').get)
 
+    def test_bound_select_direct_indexing(self):
+        self._create_accounts('charlie', 'huey', 'mickey', 'zaizee')
+
+        with self.assertQueryCount(1):
+            BAccount = Account.bind(self._db)
+            query = BAccount.select().order_by(Account.name).namedtuples()
+            self.assertEqual(query[0].name, 'charlie')
+            self.assertEqual(query[3].name, 'zaizee')
+            self.assertEqual([x.name for x in query[1:3]],
+                             ['huey', 'mickey'])
+            self.assertRaises(IndexError, lambda: query[4])
+
     def test_bound_select_caching(self):
         self._create_accounts('charlie', 'huey', 'zaizee')
         BAccount = Account.bind(self._db)
@@ -1379,6 +1393,9 @@ class TestQueryExecution(BaseDatabaseTestCase):
             for _ in range(3):
                 self.assertEqual([row.account_name for row in query],
                                  ['zaizee', 'charlie'])
+
+            self.assertEqual(query.get().account_name, 'zaizee')
+            self.assertEqual(query.first().account_name, 'zaizee')
 
         query = query.where(BAccount.name.endswith('ie'))
         with self.assertQueryCount(1):
