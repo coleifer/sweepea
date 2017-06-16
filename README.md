@@ -1,3 +1,5 @@
+![](http://media.charlesleifer.com/blog/photos/sweepea-fast.png)
+
 ## swee'pea
 
 Fast, lightweight Python database toolkit for SQLite, built with Cython.
@@ -20,14 +22,32 @@ Issue tracker and code are hosted on GitHub: https://github.com/coleifer/sweepea
 
 Documentation hosted on RT**F**D: https://sweepea.readthedocs.io/
 
-![](http://media.charlesleifer.com/blog/photos/sweepea-fast.png)
-
 ### Dependencies
 
 Cython.
 
 This project is designed to work with the standard library `sqlite3` driver, or
 alternatively, the latest version of `pysqlite2`.
+
+### Installation
+
+First install Cython and ensure that you have a SQLite library (standard
+library ``sqlite3`` or `pysqlite <https://github.com/ghaering/pysqlite>`_).
+Then:
+
+```
+$ pip install sweepea
+```
+
+Or
+
+```
+$ pip install -e git+https://github.com/coleifer/sweepea#egg=sweepea
+```
+
+-----------------------------------------------------------------
+
+## Database Helper
 
 ## Dynamic Tables
 
