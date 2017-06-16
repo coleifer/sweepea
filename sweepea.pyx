@@ -3098,6 +3098,9 @@ class BoundSelect(_BoundQuery, Select):
     def __getitem__(self, item):
         return self.execute()[item]
 
+    def get(self):
+        return self.execute().get()
+
 
 class BoundUpdate(_BoundQuery, Update): pass
 class BoundInsert(_BoundQuery, Insert): pass

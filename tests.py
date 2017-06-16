@@ -11,6 +11,7 @@ import unittest
 import sqlite3
 from sweepea import Context
 from sweepea import Database
+from sweepea import DoesNotExist
 from sweepea import fn
 from sweepea import SQL
 from sweepea import Table
@@ -1344,6 +1345,27 @@ class TestQueryExecution(BaseDatabaseTestCase):
     def _create_accounts(self, *names):
         iq = Account.insert([{Account.name: name} for name in names])
         return iq.execute(self._db)
+
+    def test_bound_select_execution(self):
+        self._create_accounts('charlie', 'huey')
+        BAccount = Account.bind(self._db)
+        huey = (BAccount
+                .select()
+                .where(BAccount.name == 'huey')
+                .dicts()
+                .execute()
+                .get())
+        self.assertEqual(huey['name'], 'huey')
+
+        huey = (BAccount
+                .select()
+                .where(BAccount.name == 'huey')
+                .dicts()
+                .get())
+        self.assertEqual(huey['name'], 'huey')
+
+        self.assertRaises(DoesNotExist,
+                          BAccount.select().where(BAccount.name == 'x').get)
 
     def test_bound_select_caching(self):
         self._create_accounts('charlie', 'huey', 'zaizee')
