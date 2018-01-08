@@ -10,6 +10,10 @@ from libc.string cimport memcpy, memset
 from collections import namedtuple
 from contextlib import contextmanager
 from functools import partial
+try:
+    from functools import reduce
+except ImportError:
+    pass
 from random import randint
 import decimal
 import hashlib
