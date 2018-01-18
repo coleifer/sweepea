@@ -420,7 +420,11 @@ class TestHelpers(BaseDatabaseTestCase):
                   for t in re.split('(\d+)', lhs)]
             l2 = [int(t) if t.isdigit() else t
                   for t in re.split('(\d+)', rhs)]
-            return cmp(l1, l2)
+            if l1 < l2:
+                return -1
+            elif l2 < l1:
+                return 1
+            return 0
 
         self.execute('CREATE TABLE register (data TEXT)')
         self.execute('INSERT INTO register (data) VALUES (?), (?), (?), (?)',
@@ -434,8 +438,6 @@ class TestHelpers(BaseDatabaseTestCase):
     def test_properties(self):
         mem_used, mem_high = self._db.memory_used
         self.assertTrue(mem_high >= mem_used)
-        self.assertFalse(mem_high == 0)
-
         self.assertTrue(self._db.cache_used is not None)
 
     def test_transactions(self):

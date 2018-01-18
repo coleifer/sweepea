@@ -4,6 +4,8 @@ from cpython.object cimport PyObject
 from cpython.ref cimport Py_INCREF, Py_DECREF
 from libc.float cimport DBL_MAX
 from libc.math cimport log, sqrt
+from libc.stdint cimport uint8_t
+from libc.stdint cimport uint32_t
 from libc.stdlib cimport free, malloc, rand
 from libc.string cimport memcpy, memset
 
@@ -40,6 +42,24 @@ except ImportError:
 
 logger = logging.getLogger('sweepea')
 logger.addHandler(NullHandler())
+
+
+cdef inline bytes encode(key):
+    cdef bytes bkey
+    if isinstance(key, unicode):
+        bkey = <bytes>key.encode('utf-8')
+    else:
+        bkey = <bytes>key
+    return bkey
+
+
+cdef inline unicode decode(key):
+    cdef unicode ukey
+    if isinstance(key, bytes):
+        ukey = key.decode('utf-8')
+    else:
+        ukey = key
+    return ukey
 
 
 cdef struct sqlite3_index_constraint:
@@ -295,9 +315,9 @@ cdef int pwConnect(sqlite3 *db, void *pAux, int argc, char **argv,
         object table_func_cls = <object>pAux
         sweepea_vtab *pNew
 
-    rc = sqlite3_declare_vtab(
-        db,
-        'CREATE TABLE x(%s);' % table_func_cls.get_table_columns_declaration())
+    rc = sqlite3_declare_vtab(db, encode(
+        'CREATE TABLE x(%s);' %
+        table_func_cls.get_table_columns_declaration()))
     if rc == SQLITE_OK:
         pNew = <sweepea_vtab *>sqlite3_malloc(sizeof(pNew[0]))
         memset(<char *>pNew, 0, sizeof(pNew[0]))
@@ -377,6 +397,7 @@ cdef int pwNext(sqlite3_vtab_cursor *pBase) with gil:
 cdef int pwColumn(sqlite3_vtab_cursor *pBase, sqlite3_context *ctx,
                   int iCol) with gil:
     cdef:
+        bytes bval
         sweepea_cursor *pCur = <sweepea_cursor *>pBase
         sqlite3_int64 x = 0
         tuple row_data
@@ -394,15 +415,19 @@ cdef int pwColumn(sqlite3_vtab_cursor *pBase, sqlite3_context *ctx,
     elif isinstance(value, float):
         sqlite3_result_double(ctx, <double>value)
     elif isinstance(value, basestring):
+        bval = encode(value)
         sqlite3_result_text(
             ctx,
-            <const char *>value,
+            <const char *>bval,
             -1,
             <sqlite3_destructor_type>-1)
     elif isinstance(value, bool):
         sqlite3_result_int(ctx, int(value))
     else:
-        sqlite3_result_error(ctx, 'Unsupported type %s' % type(value), -1)
+        sqlite3_result_error(
+            ctx,
+            encode('Unsupported type %s' % type(value)),
+            -1)
         return SQLITE_ERROR
 
     return SQLITE_OK
@@ -441,7 +466,7 @@ cdef int pwFilter(sqlite3_vtab_cursor *pBase, int idxNum,
     if not idxStr or argc == 0 and len(table_func.params):
         return SQLITE_ERROR
     elif idxStr:
-        params = str(idxStr).split(',')
+        params = decode(idxStr).split(',')
     else:
         params = []
 
@@ -457,7 +482,7 @@ cdef int pwFilter(sqlite3_vtab_cursor *pBase, int idxNum,
         elif value_type == SQLITE_FLOAT:
             query[param] = sqlite3_value_double(value)
         elif value_type == SQLITE_TEXT:
-            query[param] = str(sqlite3_value_text(value))
+            query[param] = decode(sqlite3_value_text(value))
         elif value_type == SQLITE_BLOB:
             query[param] = <bytes>sqlite3_value_blob(value)
         elif value_type == SQLITE_NULL:
@@ -517,7 +542,7 @@ cdef int pwBestIndex(sqlite3_vtab *pBase, sqlite3_index_info *pIdxInfo) \
             pIdxInfo.estimatedRows = 10 ** (nParams - nArg)
 
         # Store a reference to the columns in the index info structure.
-        joinedCols = ','.join(columns)
+        joinedCols = encode(','.join(columns))
         idxStr = <char *>sqlite3_malloc((len(joinedCols) + 1) * sizeof(char))
         memcpy(idxStr, <char *>joinedCols, len(joinedCols))
         idxStr[len(joinedCols)] = '\x00'
@@ -537,11 +562,9 @@ cdef class _TableFunctionImpl(object):
     def __cinit__(self, table_function):
         self.table_function = table_function
 
-    def __dealloc__(self):
-        Py_DECREF(self)
-
     cdef create_module(self, pysqlite_Connection* sqlite_conn):
         cdef:
+            bytes name = encode(self.table_function.name)
             sqlite3 *db = sqlite_conn.db
             int rc
 
@@ -570,7 +593,7 @@ cdef class _TableFunctionImpl(object):
         # Create the SQLite virtual table.
         rc = sqlite3_create_module(
             db,
-            <const char *>self.table_function.name,
+            <const char *>name,
             &self.module,
             <void *>(self.table_function))
 
@@ -616,86 +639,148 @@ class TableFunction(object):
         return ', '.join(accum)
 
 
-def rank(object raw_match_info):
-    # Ranking implementation, which parse matchinfo.
+def rank(py_match_info, *raw_weights):
     cdef:
         unsigned int *match_info
         unsigned int *phrase_info
-        bytes _match_info_buf = bytes(raw_match_info)
+        bytes _match_info_buf = bytes(py_match_info)
         char *match_info_buf = _match_info_buf
+        int argc = len(raw_weights)
         int ncol, nphrase, icol, iphrase, hits, global_hits
         int P_O = 0, C_O = 1, X_O = 2
-        double score = 0.0
+        double score = 0.0, weight
+        double *weights
 
-    # Handle match_info called w/default args 'pcx' - based on the example rank
-    # function http://sqlite.org/fts3.html#appendix_a
     match_info = <unsigned int *>match_info_buf
     nphrase = match_info[P_O]
     ncol = match_info[C_O]
+
+    weights = <double *>malloc(sizeof(double) * ncol)
+    for icol in range(ncol):
+        if icol < argc:
+            weights[icol] = <double>raw_weights[icol]
+        else:
+            weights[icol] = 1.0
 
     for iphrase in range(nphrase):
         phrase_info = &match_info[X_O + iphrase * ncol * 3]
         for icol in range(ncol):
+            weight = weights[icol]
+            if weight == 0:
+                continue
             hits = phrase_info[3 * icol]
             global_hits = phrase_info[3 * icol + 1]
             if hits > 0:
-                score += (<double>hits / <double>global_hits)
+                score += weight * (<double>hits / <double>global_hits)
 
-    return -score
+    free(weights)
+    return -1 * score
 
 
-def bm25(object raw_match_info):
-    """
-    Okapi BM25 ranking implementation (FTS4 only).
-
-    * Format string *must* be pcxnal
-    * Second parameter to bm25 specifies the index of the column, on
-      the table being queries.
-    """
+def lucene(py_match_info, *raw_weights):
+    # Usage: lucene(matchinfo(table, 'pcnalx'), 1)
     cdef:
         unsigned int *match_info
         unsigned int *phrase_info
-        bytes _match_info_buf = bytes(raw_match_info)
+        bytes _match_info_buf = bytes(py_match_info)
         char *match_info_buf = _match_info_buf
-        int icol, ncol, iphrase, nphrase
-        double B = 0.75, K = 1.2, D
+        int argc = len(raw_weights)
+        int term_count, col_count
         double total_docs, term_frequency,
         double doc_length, docs_with_term, avg_length
-        double idf, rhs, denom
-        int P_O = 0, C_O = 1, N_O = 2, A_O = 3, L_O, X_O
-        int x
+        double idf, weight, rhs, denom
+        double *weights
+        int P_O = 0, C_O = 1, N_O = 2, L_O, X_O
+        int i, j, x
 
         double score = 0.0
 
     match_info = <unsigned int *>match_info_buf
-    nphrase = match_info[P_O]
-    ncol = match_info[C_O]
+    term_count = match_info[P_O]
+    col_count = match_info[C_O]
     total_docs = match_info[N_O]
 
-    L_O = A_O + ncol
-    X_O = L_O + ncol
+    L_O = 3 + col_count
+    X_O = L_O + col_count
 
-    # p, 1 --> nphrase
-    # c, 1 --> ncol
-    # x, (3 * p * c) --> for each phrase/column,
-    #     term_freq for this column
-    #     term_freq for all columns
-    #     total documents containing this term
-    # n, 1 --> total rows in table
-    # a, c --> for each column, avg number of tokens in this column
-    # l, c --> for each column, length of value for this column (in this row)
-    # s, c --> ignore
+    weights = <double *>malloc(sizeof(double) * col_count)
+    for i in range(col_count):
+        if argc == 0:
+            weights[i] = 1.
+        elif i < argc:
+            weights[i] = <double>raw_weights[i]
+        else:
+            weights[i] = 0
 
-    for iphrase in range(nphrase):
-        for icol in range(ncol):
-            avg_length = match_info[A_O + icol]
-            doc_length = match_info[L_O + icol]
+    for i in range(term_count):
+        for j in range(col_count):
+            weight = weights[j]
+            if weight == 0:
+                continue
+            doc_length = match_info[L_O + j]
+            x = X_O + (3 * j * (i + 1))
+            term_frequency = match_info[x]
+            docs_with_term = match_info[x + 2]
+            idf = log(total_docs / (docs_with_term + 1.))
+            tf = sqrt(term_frequency)
+            fieldNorms = 1.0 / sqrt(doc_length)
+            score += (idf * tf * fieldNorms)
+
+    free(weights)
+    return -1 * score
+
+
+def bm25(py_match_info, *raw_weights):
+    # Usage: bm25(matchinfo(table, 'pcnalx'), 1)
+    # where the second parameter is the index of the column and
+    # the 3rd and 4th specify k and b.
+    cdef:
+        unsigned int *match_info
+        unsigned int *phrase_info
+        bytes _match_info_buf = bytes(py_match_info)
+        char *match_info_buf = _match_info_buf
+        int argc = len(raw_weights)
+        int term_count, col_count
+        double B = 0.75, K = 1.2, D
+        double total_docs, term_frequency,
+        double doc_length, docs_with_term, avg_length
+        double idf, weight, rhs, denom
+        double *weights
+        int P_O = 0, C_O = 1, N_O = 2, A_O = 3, L_O, X_O
+        int i, j, x
+
+        double score = 0.0
+
+    match_info = <unsigned int *>match_info_buf
+    term_count = match_info[P_O]
+    col_count = match_info[C_O]
+    total_docs = match_info[N_O]
+
+    L_O = A_O + col_count
+    X_O = L_O + col_count
+
+    weights = <double *>malloc(sizeof(double) * col_count)
+    for i in range(col_count):
+        if argc == 0:
+            weights[i] = 1.
+        elif i < argc:
+            weights[i] = <double>raw_weights[i]
+        else:
+            weights[i] = 0
+
+    for i in range(term_count):
+        for j in range(col_count):
+            weight = weights[j]
+            if weight == 0:
+                continue
+            avg_length = match_info[A_O + j]
+            doc_length = match_info[L_O + j]
             if avg_length == 0:
                 D = 0
             else:
                 D = 1 - B + (B * (doc_length / avg_length))
 
-            x = X_O + (3 * icol * (iphrase + 1))
+            x = X_O + (3 * j * (i + 1))
             term_frequency = match_info[x]
             docs_with_term = match_info[x + 2]
             idf = max(
@@ -709,66 +794,28 @@ def bm25(object raw_match_info):
             else:
                 rhs = (term_frequency * (K + 1)) / denom
 
-            score += (idf * rhs)
+            score += (idf * rhs) * weight
 
+    free(weights)
     return -1 * score
 
 
-def lucene(raw_match_info):
-    # Usage: peewee_lucene(matchinfo(table, 'pcxnal'), 1)
+cdef uint32_t murmurhash2(const unsigned char *key, ssize_t nlen,
+                          uint32_t seed):
     cdef:
-        unsigned int *match_info
-        unsigned int *phrase_info
-        bytes _match_info_buf = bytes(raw_match_info)
-        char *match_info_buf = _match_info_buf
-        int icol, ncol, iphrase, nphrase
-        double total_docs, term_frequency,
-        double doc_length, docs_with_term, avg_length
-        double idf, weight, rhs, denom
-        int P_O = 0, C_O = 1, N_O = 2, L_O, X_O
-        int i, j, x
-
-        double score = 0.0
-
-    match_info = <unsigned int *>match_info_buf
-    nphrase = match_info[P_O]
-    ncol = match_info[C_O]
-    total_docs = match_info[N_O]
-
-    L_O = 3 + ncol
-    X_O = L_O + ncol
-
-    for iphrase in range(nphrase):
-        for icol in range(ncol):
-            doc_length = match_info[L_O + icol]
-            x = X_O + (3 * icol * (iphrase + 1))
-            term_frequency = match_info[x]
-            docs_with_term = match_info[x + 2]
-            idf = log(total_docs / (docs_with_term + 1.))
-            tf = sqrt(term_frequency)
-            fieldNorms = 1.0 / sqrt(doc_length)
-            score += (idf * tf * fieldNorms)
-
-    return -1 * score
-
-
-cdef unsigned int murmurhash2(const char *key, int nlen, unsigned int seed):
-    cdef:
-        unsigned int m = 0x5bd1e995
+        uint32_t m = 0x5bd1e995
         int r = 24
-        unsigned int l = nlen
-        unsigned char *data = <unsigned char *>key
-        unsigned int h = seed
-        unsigned int k
-        unsigned int t = 0
+        const unsigned char *data = key
+        uint32_t h = seed ^ nlen
+        uint32_t k
 
     while nlen >= 4:
-        k = <unsigned int>(<unsigned int *>data)[0]
+        k = <uint32_t>((<uint32_t *>data)[0])
 
-        # mmix(h, k).
         k *= m
         k = k ^ (k >> r)
         k *= m
+
         h *= m
         h = h ^ k
 
@@ -776,30 +823,16 @@ cdef unsigned int murmurhash2(const char *key, int nlen, unsigned int seed):
         nlen -= 4
 
     if nlen == 3:
-        t = t ^ (data[2] << 16)
+        h = h ^ (data[2] << 16)
     if nlen >= 2:
-        t = t ^ (data[1] << 8)
+        h = h ^ (data[1] << 8)
     if nlen >= 1:
-        t = t ^ (data[0])
-
-    # mmix(h, t).
-    t *= m
-    t = t ^ (t >> r)
-    t *= m
-    h *= m
-    h = h ^ t
-
-    # mmix(h, l).
-    l *= m
-    l = l ^ (l >> r)
-    l *= m
-    h *= m
-    h = h ^ l
+        h = h ^ (data[0])
+        h *= m
 
     h = h ^ (h >> 13)
     h *= m
     h = h ^ (h >> 15)
-
     return h
 
 
@@ -817,7 +850,7 @@ def murmurhash(key, seed=None):
         bkey = <bytes>key
 
     if key:
-        return murmurhash2(<char *>bkey, len(bkey), nseed)
+        return murmurhash2(<unsigned char *>bkey, len(bkey), nseed)
     return 0
 
 
@@ -830,7 +863,7 @@ def make_hash(hash_impl):
     def inner(*items):
         state = hash_impl()
         for item in items:
-            state.update(item)
+            state.update(encode(item))
         return state.hexdigest()
     return inner
 
@@ -889,6 +922,28 @@ cdef class median(object):
             return self.items[0]
         else:
             return self.selectKth(self.ct / 2)
+
+
+def _register_functions(database, pairs):
+    for func, name in pairs:
+        database.func(name)(func)
+
+
+def register_hash_functions(database):
+    _register_functions(database, (
+        (murmurhash, 'murmurhash'),
+        (hash_md5, 'md5'),
+        (hash_sha1, 'sha1'),
+        (hash_sha256, 'sha256'),
+        (zlib.adler32, 'adler32'),
+        (zlib.crc32, 'crc32')))
+
+
+def register_rank_functions(database):
+    _register_functions(database, (
+        (bm25, 'fts_bm25'),
+        (lucene, 'fts_lucene'),
+        (rank, 'fts_rank')))
 
 
 class DateSeries(TableFunction):
@@ -982,6 +1037,7 @@ cdef class ResultIterator(object):
             raise StopIteration
         self.index += 1
         return obj
+    next = __next__
 
 
 cdef class CursorWrapper(object):
@@ -1213,7 +1269,7 @@ cdef _sqlite_to_python(sqlite3_context *context, int n, sqlite3_value **args):
         elif value_type == SQLITE_FLOAT:
             obj = sqlite3_value_double(value)
         elif value_type == SQLITE_TEXT:
-            obj = str(sqlite3_value_text(value))
+            obj = decode(sqlite3_value_text(value))
         elif value_type == SQLITE_BLOB:
             obj = <bytes>sqlite3_value_blob(value)
         else:
@@ -1224,6 +1280,7 @@ cdef _sqlite_to_python(sqlite3_context *context, int n, sqlite3_value **args):
 
 
 cdef _python_to_sqlite(sqlite3_context *context, value):
+    cdef bytes bval
     # Store a Python value in a sqlite3_context object. For instance, store the
     # result to a user-defined function call so it is accessible in SQLite.
     if value is None:
@@ -1233,12 +1290,16 @@ cdef _python_to_sqlite(sqlite3_context *context, value):
     elif isinstance(value, float):
         sqlite3_result_double(context, <double>value)
     elif isinstance(value, basestring):
-        sqlite3_result_text(context, <const char *>value, -1,
+        bval = encode(value)
+        sqlite3_result_text(context, <const char *>bval, -1,
                             <sqlite3_destructor_type>-1)
     elif isinstance(value, bool):
         sqlite3_result_int(context, int(value))
     else:
-        sqlite3_result_error(context, 'Unsupported type %s' % type(value), -1)
+        sqlite3_result_error(
+            context,
+            encode('Unsupported type %s' % type(value)),
+            -1)
         return SQLITE_ERROR
 
     return SQLITE_OK
@@ -1280,7 +1341,7 @@ cdef void _update_callback(void *userData, int queryType, char *database,
         query = 'DELETE'
     else:
         query = ''
-    fn(query, str(database), str(table), <int>rowid)
+    fn(query, decode(database), decode(table), <int>rowid)
 
 
 class ConnectionLocal(threading.local):
@@ -1342,19 +1403,12 @@ cdef class Database(object):
 
         # Register built-in custom functions.
         if rank_functions:
-            self.func('rank')(rank)
-            self.func('bm25')(bm25)
-            self.func('lucene')(lucene)
+            register_rank_functions(self)
             self.aggregate('median')(median)
         if regex_function:
             self.func('regexp')(regexp)
         if hash_functions:
-            self.func('murmurhash')(murmurhash)
-            self.func('md5')(hash_md5)
-            self.func('sha1')(hash_sha1)
-            self.func('sha256')(hash_sha256)
-            self.func('adler32')(zlib.adler32)
-            self.func('crc32')(zlib.crc32)
+            register_hash_functions(self)
 
     def init(self, database, **connect_kwargs):
         """Initialize the database with a new name and connection params."""
@@ -2258,10 +2312,10 @@ class Table(BaseTable):
         return self.select().where(reduce(operator.and_, accum))
 
     def rank(self):
-        return fn.rank(fn.matchinfo(Entity(self._name), 'pcx'))
+        return fn.fts_rank(fn.matchinfo(Entity(self._name), 'pcx'))
 
     def bm25(self):
-        return fn.bm25(fn.matchinfo(Entity(self._name), 'pcnalx'))
+        return fn.fts_bm25(fn.matchinfo(Entity(self._name), 'pcnalx'))
 
     def match(self, rhs):
         return Expression(Entity(self._name), 'MATCH', rhs)
@@ -2383,7 +2437,7 @@ class ColumnBase(Node):
         return Expression(lhs, '+', self)
     __sub__ = __e__('-')
     __mul__ = __e__('*')
-    __div__ = __e__('/')
+    __div__ = __truediv__ = __e__('/')
     __rand__ = __e__('AND', True)
     __ror__ = __e__('OR', True)
     __rsub__ = __e__('-', True)
@@ -3005,7 +3059,7 @@ class Insert(WriteQuery):
                 row = next(rows_iter)
             except StopIteration:
                 return ctx.sql('DEFAULT VALUES')
-            columns = row.keys()
+            columns = list(row.keys())
             rows_iter = itertools.chain(iter((row,)), rows_iter)
 
         ctx.sql(EnclosedNodeList(columns)).literal(' VALUES ')
@@ -3140,18 +3194,21 @@ SQLITE_TIME_FORMATS = (
 
 
 cpdef format_datetime(date_value):
+    cdef unicode date_str = decode(date_value)
     for date_format in SQLITE_DATETIME_FORMATS:
         try:
-            return datetime.datetime.strptime(date_value, date_format)
+            return datetime.datetime.strptime(date_str, date_format)
         except ValueError:
             pass
 
 
 cpdef format_date(date_value):
-    cdef datetime.datetime date_obj
+    cdef:
+        datetime.datetime date_obj
+        unicode date_str = decode(date_value)
     for date_format in SQLITE_DATE_FORMATS:
         try:
-            date_obj = datetime.datetime.strptime(date_value, date_format)
+            date_obj = datetime.datetime.strptime(date_str, date_format)
         except ValueError:
             pass
         else:
@@ -3159,10 +3216,12 @@ cpdef format_date(date_value):
 
 
 cpdef format_time(time_value):
-    cdef datetime.datetime date_obj
+    cdef:
+        datetime.datetime date_obj
+        unicode date_str = decode(time_value)
     for date_format in SQLITE_TIME_FORMATS:
         try:
-            date_obj = datetime.datetime.strptime(time_value, date_format)
+            date_obj = datetime.datetime.strptime(date_str, date_format)
         except ValueError:
             pass
         else:
