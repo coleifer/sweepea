@@ -1424,7 +1424,7 @@ cdef class Database(object):
         kwargs.setdefault('detect_types', pysqlite.PARSE_DECLTYPES)
         self.init(database, **kwargs)
 
-        self._pragmas = pragmas or []
+        self._pragmas = list(pragmas) if pragmas else []
         if journal_mode is not None:
             self._pragmas.append(('journal_mode', journal_mode))
 
