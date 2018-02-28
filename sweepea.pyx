@@ -83,9 +83,11 @@ cdef extern from "sqlite3.h":
     ctypedef struct sqlite3:
         int busyTimeout
     ctypedef struct sqlite3_backup
+    ctypedef struct sqlite3_blob
     ctypedef struct sqlite3_context
     ctypedef struct sqlite3_value
     ctypedef long long sqlite3_int64
+    ctypedef unsigned long long sqlite_uint64
 
     # Virtual tables.
     ctypedef struct sqlite3_module  # Forward reference.
@@ -206,20 +208,6 @@ cdef extern from "sqlite3.h":
     cdef int sqlite3_get_autocommit(sqlite3 *db)
     cdef sqlite3_int64 sqlite3_last_insert_rowid(sqlite3 *db)
 
-    cdef int sqlite3_create_function(
-        sqlite3 *db,
-        const char *zFunctionName,
-        int nArg,
-        int eEncoding,
-        void *pApp,
-        void (*xFunc)(sqlite3_context *, int, sqlite3_value **),
-        void (*xStep)(sqlite3_context *, int, sqlite3_value **),
-        void (*xFinal)(sqlite3_context *))
-    cdef void *sqlite3_user_data(sqlite3_context *)
-
-    cdef void *sqlite3_get_auxdata(sqlite3_context *, int N)
-    cdef void sqlite3_set_auxdata(sqlite3_context *, int N, void *, void(*)(void *))
-
     cdef void *sqlite3_commit_hook(sqlite3 *, int(*)(void *), void *)
     cdef void *sqlite3_rollback_hook(sqlite3 *, void(*)(void *), void *)
     cdef void *sqlite3_update_hook(
@@ -250,12 +238,35 @@ cdef extern from "sqlite3.h":
     cdef int SQLITE_DBSTATUS_CACHE_MISS = 8
     cdef int SQLITE_DBSTATUS_CACHE_WRITE = 9
     cdef int SQLITE_DBSTATUS_DEFERRED_FKS = 10
-    cdef int SQLITE_DBSTATUS_CACHE_USED_SHARED = 11
+    #cdef int SQLITE_DBSTATUS_CACHE_USED_SHARED = 11
     cdef int sqlite3_db_status(sqlite3 *, int op, int *pCur, int *pHigh, int reset)
 
     cdef int SQLITE_DELETE = 9
     cdef int SQLITE_INSERT = 18
     cdef int SQLITE_UPDATE = 23
+
+    cdef int SQLITE_CONFIG_SINGLETHREAD = 1  # None
+    cdef int SQLITE_CONFIG_MULTITHREAD = 2  # None
+    cdef int SQLITE_CONFIG_SERIALIZED = 3  # None
+    cdef int SQLITE_CONFIG_SCRATCH = 6  # void *, int sz, int N
+    cdef int SQLITE_CONFIG_PAGECACHE = 7  # void *, int sz, int N
+    cdef int SQLITE_CONFIG_HEAP = 8  # void *, int nByte, int min
+    cdef int SQLITE_CONFIG_MEMSTATUS = 9  # boolean
+    cdef int SQLITE_CONFIG_LOOKASIDE = 13  # int, int
+    cdef int SQLITE_CONFIG_URI = 17  # int
+    cdef int SQLITE_CONFIG_MMAP_SIZE = 22  # sqlite3_int64, sqlite3_int64
+    cdef int SQLITE_CONFIG_STMTJRNL_SPILL = 26  # int nByte
+    cdef int SQLITE_DBCONFIG_MAINDBNAME = 1000  # const char*
+    cdef int SQLITE_DBCONFIG_LOOKASIDE = 1001  # void* int int
+    cdef int SQLITE_DBCONFIG_ENABLE_FKEY = 1002  # int int*
+    cdef int SQLITE_DBCONFIG_ENABLE_TRIGGER = 1003  # int int*
+    cdef int SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER = 1004  # int int*
+    cdef int SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION = 1005  # int int*
+    cdef int SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE = 1006  # int int*
+    cdef int SQLITE_DBCONFIG_ENABLE_QPSG = 1007  # int int*
+
+    cdef int sqlite3_config(int, ...)
+    cdef int sqlite3_db_config(sqlite3*, int op, ...)
 
     # Misc.
     cdef int sqlite3_busy_handler(sqlite3 *db, int(*)(void *, int), void *)
@@ -276,6 +287,21 @@ cdef extern from "sqlite3.h":
     cdef int sqlite3_errcode(sqlite3 *db)
     cdef int sqlite3_errstr(int)
     cdef const char *sqlite3_errmsg(sqlite3 *db)
+
+    cdef int sqlite3_blob_open(
+          sqlite3*,
+          const char *zDb,
+          const char *zTable,
+          const char *zColumn,
+          sqlite3_int64 iRow,
+          int flags,
+          sqlite3_blob **ppBlob)
+    cdef int sqlite3_blob_reopen(sqlite3_blob *, sqlite3_int64)
+    cdef int sqlite3_blob_close(sqlite3_blob *)
+    cdef int sqlite3_blob_bytes(sqlite3_blob *)
+    cdef int sqlite3_blob_read(sqlite3_blob *, void *Z, int N, int iOffset)
+    cdef int sqlite3_blob_write(sqlite3_blob *, const void *z, int n,
+                                int iOffset)
 
 
 cdef extern from "_pysqlite/connection.h":
@@ -315,9 +341,10 @@ cdef int pwConnect(sqlite3 *db, void *pAux, int argc, char **argv,
         object table_func_cls = <object>pAux
         sweepea_vtab *pNew
 
-    rc = sqlite3_declare_vtab(db, encode(
-        'CREATE TABLE x(%s);' %
-        table_func_cls.get_table_columns_declaration()))
+    rc = sqlite3_declare_vtab(
+        db,
+        encode('CREATE TABLE x(%s);' %
+               table_func_cls.get_table_columns_declaration()))
     if rc == SQLITE_OK:
         pNew = <sweepea_vtab *>sqlite3_malloc(sizeof(pNew[0]))
         memset(<char *>pNew, 0, sizeof(pNew[0]))
@@ -1487,11 +1514,7 @@ cdef class Database(object):
         """
         conn.isolation_level = None  # Disable transaction state-machine.
 
-        if self._pragmas:
-            cursor = conn.cursor()
-            for pragma, value in self._pragmas:
-                cursor.execute('PRAGMA %s = %s;' % (pragma, value))
-            cursor.close()
+        self._set_pragmas(conn)
 
         if self._aggregates:
             for name, klass in self._aggregates.items():
@@ -1626,23 +1649,29 @@ cdef class Database(object):
         sql, params = Context().parse(query)
         return self.execute_sql(sql, params, query.commit)
 
-    def pragma(self, key, value=__sentinel__):
-        """
-        Issue a PRAGMA query on the current connection. To query the status of
-        a specific PRAGMA, typically only the key is specified. See also the
-        list of PRAGMAs which are exposed as properties on the Database.
-        """
+    def _set_pragmas(self, conn):
+        if self._pragmas:
+            cursor = conn.cursor()
+            for pragma, value in self._pragmas:
+                cursor.execute('PRAGMA %s = %s;' % (pragma, value))
+            cursor.close()
+
+    def pragma(self, key, value=__sentinel__, permanent=False):
         sql = 'PRAGMA %s' % key
         if value is not __sentinel__:
-            sql += ' = %s' % value
+            sql += ' = %s' % (value or 0)
+            if permanent:
+                pragmas = dict(self._pragmas or ())
+                pragmas[key] = value
+                self._pragmas = list(pragmas.items())
+        elif permanent:
+            raise ValueError('Cannot specify a permanent pragma without value')
         row = self.execute_sql(sql).fetchone()
         if row:
             return row[0]
 
     def add_pragma(self, key, value):
-        self._pragmas.append((key, value))
-        if not self.is_closed():
-            self.pragma(key, value)
+        self.pragma(key, value, True)
 
     def remove_pragma(self, key):
         self._pragmas = [(k, v) for k, v in self._pragmas if k != key]
@@ -1865,8 +1894,6 @@ cdef class Database(object):
     lookaside_miss_full = __dbstatus__(SQLITE_DBSTATUS_LOOKASIDE_MISS_FULL,
                                        True)
     cache_used = __dbstatus__(SQLITE_DBSTATUS_CACHE_USED, False, True)
-    cache_used_shared = __dbstatus__(SQLITE_DBSTATUS_CACHE_USED_SHARED,
-                                     False, True)
     schema_used = __dbstatus__(SQLITE_DBSTATUS_SCHEMA_USED, False, True)
     statement_used = __dbstatus__(SQLITE_DBSTATUS_STMT_USED, False, True)
     cache_hit = __dbstatus__(SQLITE_DBSTATUS_CACHE_HIT, False, True)
@@ -2255,6 +2282,12 @@ class Table(BaseTable):
             for column in self._columns:
                 setattr(self, column, Column(self, column))
 
+    def _get_column(self, name):
+        if self._columns:
+            return getattr(self, name)
+        else:
+            return getattr(self.c, name)
+
     def __hash__(self):
         return hash((self._schema, self._name, self._alias))
 
@@ -2343,12 +2376,20 @@ class BoundTable(Table):
             selection = [Column(self, column) for column in self._columns]
         return BoundSelect(self._database, (self,), selection)
 
-    def insert(self, data=None, **kwargs):
-        return BoundInsert(self._database, self, data, **kwargs)
+    def insert(self, data=None, columns=None, on_conflict=None, **kwargs):
+        if kwargs:
+            data = data or {}
+            for key, value in kwargs.items():
+                data[Column(self, key)] = value
+        return BoundInsert(self._database, self, data, columns=columns,
+                           on_conflict=on_conflict)
 
-    def update(self, data=None, **kwargs):
-        # TODO: normalize
-        return BoundUpdate(self._database, self, data)
+    def update(self, data=None, on_conflict=None, **kwargs):
+        if kwargs:
+            data = data or {}
+            for key, value in kwargs.items():
+                data[Column(self, key)] = value
+        return BoundUpdate(self._database, self, data, on_conflict=on_conflict)
 
     def delete(self):
         return BoundDelete(self._database, self)
@@ -3041,7 +3082,8 @@ class Insert(WriteQuery):
 
     def _simple_insert(self, Context ctx):
         columns, values = [], []
-        for key, value in self.data.items():
+        for key in sorted(self.data, key=operator.attrgetter('name')):
+            value = self.data[key]
             columns.append(key)
             if not isinstance(value, Node):
                 value = Value(value)
@@ -3059,15 +3101,23 @@ class Insert(WriteQuery):
                 row = next(rows_iter)
             except StopIteration:
                 return ctx.sql('DEFAULT VALUES')
-            columns = list(row.keys())
+            columns = [c if isinstance(c, Node) else self.table._get_column(c)
+                       for c in row]
             rows_iter = itertools.chain(iter((row,)), rows_iter)
 
         ctx.sql(EnclosedNodeList(columns)).literal(' VALUES ')
         all_values = []
+        ncols = range(len(columns))
+
         for row in rows_iter:
             values = []
-            for column in columns:
-                value = row[column]
+            if isinstance(row, dict):
+                indexes = columns
+            else:
+                indexes = ncols
+
+            for index in indexes:
+                value = row[index]
                 if not isinstance(value, Node):
                     value = Value(value)
                 values.append(value)

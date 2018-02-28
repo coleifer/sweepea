@@ -1056,7 +1056,7 @@ class TestQueryBuilder(BaseTestCase):
 
 
 class TestInsertQuery(BaseTestCase):
-    def test_insert_query(self):
+    def test_insert(self):
         query = User.insert({
             User.c.username: 'charlie',
             User.c.superuser: False,
@@ -1068,7 +1068,7 @@ class TestInsertQuery(BaseTestCase):
         query = User.insert(username='charlie', superuser=False)
         self.assertSQL(query, (
             'INSERT INTO "users" ("superuser", "username") VALUES (?, ?)'),
-            (False, 'charlie'))
+            [False, 'charlie'])
 
     def test_insert_list(self):
         data = [
@@ -1083,6 +1083,12 @@ class TestInsertQuery(BaseTestCase):
         query = Person.insert(data, columns=(Person.name,))
         self.assertSQL(query, (
             'INSERT INTO "person" ("name") VALUES (?), (?), (?)'),
+            ['charlie', 'huey', 'zaizee'])
+
+        data = [('charlie',), ('huey',), ('zaizee',)]
+        query = User.insert(data, columns=[User.c.username])
+        self.assertSQL(query, (
+            'INSERT INTO "users" ("username") VALUES (?), (?), (?)'),
             ['charlie', 'huey', 'zaizee'])
 
     def test_insert_query(self):
@@ -1114,7 +1120,7 @@ class TestInsertQuery(BaseTestCase):
 
 
 class TestUpdateQuery(BaseTestCase):
-    def test_update_query(self):
+    def test_update(self):
         query = (User
                  .update({User.c.counter: User.c.counter + 1})
                  .where(User.c.username == 'nugz'))
@@ -1165,7 +1171,7 @@ class TestUpdateQuery(BaseTestCase):
 
 
 class TestDeleteQuery(BaseTestCase):
-    def test_delete_query(self):
+    def test_delete(self):
         query = (User
                  .delete()
                  .where(User.c.username != 'charlie')
@@ -1345,6 +1351,36 @@ class TestQueryExecution(BaseDatabaseTestCase):
                 .execute(self._db))
         self.assertEqual([row.name for row in curs],
                          ['huey', 'mickey'])
+
+    def test_bound_insert_execution(self):
+        BA = Account.bind(self._db)
+        rowid = BA.insert({BA.name: 'charlie'}).execute()
+        self.assertEqual(rowid, 1)
+
+        rowid = BA.insert(name='huey').execute()
+        self.assertEqual(rowid, 2)
+
+        rowid = BA.insert([{Account.name: 'zaizee'}, ('mickey',)],
+                          columns=[Account.name]).execute()
+        self.assertEqual(rowid, 4)
+
+        curs = BA.select(BA.name).order_by(BA.name).namedtuples()
+        self.assertEqual([a.name for a in curs], ['charlie', 'huey', 'mickey',
+                                                  'zaizee'])
+
+    def test_bound_update_execution(self):
+        BA = Account.bind(self._db)
+        BA.insert([(name,) for name in ('charlie', 'huey', 'zaizee')],
+                  columns=[BA.name]).execute()
+
+        query = (BA
+                 .update({BA.name: BA.name.concat('-x')})
+                 .where(BA.name != 'huey'))
+        self.assertEqual(query.execute(), 2)
+
+        curs = BA.select(BA.name).order_by(BA.name).namedtuples()
+        self.assertEqual([a.name for a in curs],
+                         ['charlie-x', 'huey', 'zaizee-x'])
 
     def _create_accounts(self, *names):
         iq = Account.insert([{Account.name: name} for name in names])
