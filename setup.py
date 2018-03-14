@@ -19,7 +19,7 @@ extension = Extension(
 
 setup(
     name='sweepea',
-    version='0.3.0',
+    version='0.3.1',
     description='',
     url='https://github.com/coleifer/sweepea',
     install_requires=['Cython'],

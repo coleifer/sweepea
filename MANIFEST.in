@@ -1,0 +1,9 @@
+include README.md
+include LICENSE
+include sweepea.pyx
+include tests.py
+recursive-include docs *
+
+global-exclude *.pyc
+global-exclude *.o
+global-exclude *.so
