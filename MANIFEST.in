@@ -2,6 +2,7 @@ include README.md
 include LICENSE
 include sweepea.pyx
 include tests.py
+recursive-include _pysqlite *
 recursive-include docs *
 
 global-exclude *.pyc
