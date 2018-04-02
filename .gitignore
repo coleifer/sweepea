@@ -1,4 +1,4 @@
 sweepea.c
-sweepea.so
+sweepea*.so
 MANIFEST
 build/*
