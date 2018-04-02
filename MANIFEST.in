@@ -1,5 +1,6 @@
 include README.md
 include LICENSE
+include sweepea.c
 include sweepea.pyx
 include tests.py
 recursive-include _pysqlite *

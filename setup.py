@@ -1,14 +1,22 @@
 import glob
 import os
+import warnings
 
 from distutils.core import setup, Extension
 try:
     from Cython.Build import cythonize
 except ImportError:
-    import warnings
-    raise RuntimeError('Cython must be installed to build sweepea.')
+    cython_installed = False
+    warnings.warn('Cython not installed, using pre-generated C source file.')
+else:
+    cython_installed = True
 
-python_source = 'sweepea.pyx'
+if cython_installed:
+    python_source = 'sweepea.pyx'
+else:
+    python_source = 'sweepea.c'
+    cythonize = lambda obj: obj
+
 extension = Extension(
     'sweepea',
     define_macros=[('MODULE_NAME', '"sweepea"')],
@@ -19,11 +27,11 @@ extension = Extension(
 
 setup(
     name='sweepea',
-    version='0.3.2',
+    version='0.3.3',
     description='',
     url='https://github.com/coleifer/sweepea',
     install_requires=['Cython'],
     author='Charles Leifer',
     author_email='',
-    ext_modules=cythonize(extension),
+    ext_modules=cythonize([extension]),
 )

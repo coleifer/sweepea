@@ -1,7 +1,10 @@
 from cpython cimport datetime
+from cpython.bytes cimport PyBytes_Check
 from cpython.mem cimport PyMem_Free
 from cpython.object cimport PyObject
 from cpython.ref cimport Py_INCREF, Py_DECREF
+from cpython.unicode cimport PyUnicode_AsUTF8String
+from cpython.unicode cimport PyUnicode_Check
 from libc.float cimport DBL_MAX
 from libc.math cimport log, sqrt
 from libc.stdint cimport uint8_t
@@ -46,8 +49,8 @@ logger.addHandler(NullHandler())
 
 cdef inline bytes encode(key):
     cdef bytes bkey
-    if isinstance(key, unicode):
-        bkey = <bytes>key.encode('utf-8')
+    if PyUnicode_Check(key):
+        bkey = PyUnicode_AsUTF8String(key)
     else:
         bkey = <bytes>key
     return bkey
@@ -55,7 +58,7 @@ cdef inline bytes encode(key):
 
 cdef inline unicode decode(key):
     cdef unicode ukey
-    if isinstance(key, bytes):
+    if PyBytes_Check(key):
         ukey = key.decode('utf-8')
     else:
         ukey = key
