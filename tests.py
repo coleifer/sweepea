@@ -493,6 +493,7 @@ class TestHelpers(BaseDatabaseTestCase):
         assertRegister(['k3'])
 
     def test_pragmas(self):
+        self._db.page_size = 4096
         self.assertEqual(self._db.page_size, 4096)
         self._db.page_size = 1024
         self.assertEqual(self._db.page_size, 1024)
