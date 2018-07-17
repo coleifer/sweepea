@@ -725,7 +725,7 @@ class DateSeries(TableFunction):
         return (current.strftime(self.format),)
 
 
-cdef int _aggressive_busy_handler(void *ptr, int n):
+cdef int _aggressive_busy_handler(void *ptr, int n) nogil:
     # In concurrent environments, it often seems that if multiple queries are
     # kicked off at around the same time, they proceed in lock-step to check
     # for the availability of the lock. By introducing some "jitter" we can

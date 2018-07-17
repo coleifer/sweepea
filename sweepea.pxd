@@ -39,7 +39,7 @@ cdef struct sqlite3_index_constraint_usage:
     unsigned char omit
 
 
-cdef extern from "sqlite3.h":
+cdef extern from "sqlite3.h" nogil:
     ctypedef struct sqlite3:
         int busyTimeout
     ctypedef struct sqlite3_backup
