@@ -52,7 +52,7 @@ logger.addHandler(NullHandler())
 # We define an xConnect function, but leave xCreate NULL so that the
 # table-function can be called eponymously.
 cdef int pwConnect(sqlite3 *db, void *pAux, int argc, char **argv,
-                   sqlite3_vtab **ppVtab, char **pzErr) with gil:
+                   sqlite3_vtab **ppVtab, char **pzErr) noexcept with gil:
     cdef:
         int rc
         object table_func_cls = <object>pAux
@@ -73,7 +73,7 @@ cdef int pwConnect(sqlite3 *db, void *pAux, int argc, char **argv,
     return rc
 
 
-cdef int pwDisconnect(sqlite3_vtab *pBase) with gil:
+cdef int pwDisconnect(sqlite3_vtab *pBase) noexcept with gil:
     cdef:
         sweepea_vtab *pVtab = <sweepea_vtab *>pBase
         object table_func_cls = <object>(pVtab.table_func_cls)
@@ -85,7 +85,7 @@ cdef int pwDisconnect(sqlite3_vtab *pBase) with gil:
 
 # The xOpen method is used to initialize a cursor. In this method we
 # instantiate the TableFunction class and zero out a new cursor for iteration.
-cdef int pwOpen(sqlite3_vtab *pBase, sqlite3_vtab_cursor **ppCursor) with gil:
+cdef int pwOpen(sqlite3_vtab *pBase, sqlite3_vtab_cursor **ppCursor) noexcept with gil:
     cdef:
         sweepea_vtab *pVtab = <sweepea_vtab *>pBase
         sweepea_cursor *pCur
@@ -102,7 +102,7 @@ cdef int pwOpen(sqlite3_vtab *pBase, sqlite3_vtab_cursor **ppCursor) with gil:
     return SQLITE_OK
 
 
-cdef int pwClose(sqlite3_vtab_cursor *pBase) with gil:
+cdef int pwClose(sqlite3_vtab_cursor *pBase) noexcept with gil:
     cdef:
         sweepea_cursor *pCur = <sweepea_cursor *>pBase
         object table_func = <object>pCur.table_func
@@ -113,7 +113,7 @@ cdef int pwClose(sqlite3_vtab_cursor *pBase) with gil:
 
 # Iterate once, advancing the cursor's index and assigning the row data to the
 # `row_data` field on the sweepea_cursor struct.
-cdef int pwNext(sqlite3_vtab_cursor *pBase) with gil:
+cdef int pwNext(sqlite3_vtab_cursor *pBase) noexcept with gil:
     cdef:
         sweepea_cursor *pCur = <sweepea_cursor *>pBase
         object table_func = <object>pCur.table_func
@@ -139,7 +139,7 @@ cdef int pwNext(sqlite3_vtab_cursor *pBase) with gil:
 
 # Return the requested column from the current row.
 cdef int pwColumn(sqlite3_vtab_cursor *pBase, sqlite3_context *ctx,
-                  int iCol) with gil:
+                  int iCol) noexcept with gil:
     cdef:
         bytes bval
         sweepea_cursor *pCur = <sweepea_cursor *>pBase
@@ -177,7 +177,7 @@ cdef int pwColumn(sqlite3_vtab_cursor *pBase, sqlite3_context *ctx,
     return SQLITE_OK
 
 
-cdef int pwRowid(sqlite3_vtab_cursor *pBase, sqlite3_int64 *pRowid):
+cdef int pwRowid(sqlite3_vtab_cursor *pBase, sqlite3_int64 *pRowid) noexcept:
     cdef:
         sweepea_cursor *pCur = <sweepea_cursor *>pBase
     pRowid[0] = <sqlite3_int64>pCur.idx
@@ -185,7 +185,7 @@ cdef int pwRowid(sqlite3_vtab_cursor *pBase, sqlite3_int64 *pRowid):
 
 
 # Return a boolean indicating whether the cursor has been consumed.
-cdef int pwEof(sqlite3_vtab_cursor *pBase):
+cdef int pwEof(sqlite3_vtab_cursor *pBase) noexcept:
     cdef:
         sweepea_cursor *pCur = <sweepea_cursor *>pBase
     if pCur.stopped:
@@ -197,7 +197,7 @@ cdef int pwEof(sqlite3_vtab_cursor *pBase):
 # get access to the parameters that the function was called with, and call the
 # TableFunction's `initialize()` function.
 cdef int pwFilter(sqlite3_vtab_cursor *pBase, int idxNum,
-                  const char *idxStr, int argc, sqlite3_value **argv) with gil:
+                  const char *idxStr, int argc, sqlite3_value **argv) noexcept with gil:
     cdef:
         sweepea_cursor *pCur = <sweepea_cursor *>pBase
         object table_func = <object>pCur.table_func
@@ -250,7 +250,7 @@ cdef int pwFilter(sqlite3_vtab_cursor *pBase, int idxNum,
 # SQLite will (in some cases, repeatedly) call the xBestIndex method to try and
 # find the best query plan.
 cdef int pwBestIndex(sqlite3_vtab *pBase, sqlite3_index_info *pIdxInfo) \
-        with gil:
+        noexcept with gil:
     cdef:
         int i
         int idxNum = 0, nArg = 0
@@ -283,7 +283,7 @@ cdef int pwBestIndex(sqlite3_vtab *pBase, sqlite3_index_info *pIdxInfo) \
         else:
             # Penalize score based on number of missing params.
             pIdxInfo.estimatedCost = <double>10000000000000 * <double>(nParams - nArg)
-            pIdxInfo.estimatedRows = 10 ** (nParams - nArg)
+            pIdxInfo.estimatedRows = 10 * (nParams - nArg)
 
         # Store a reference to the columns in the index info structure.
         joinedCols = encode(','.join(columns))
@@ -675,7 +675,7 @@ cdef class median(object):
         elif self.ct < 3:
             return self.items[0]
         else:
-            return self.selectKth(self.ct / 2)
+            return self.selectKth(self.ct // 2)
 
 
 def _register_functions(database, pairs):
@@ -735,7 +735,7 @@ class DateSeries(TableFunction):
         return (current.strftime(self.format),)
 
 
-cdef int _aggressive_busy_handler(void *ptr, int n) nogil:
+cdef int _aggressive_busy_handler(void *ptr, int n) noexcept nogil:
     # In concurrent environments, it often seems that if multiple queries are
     # kicked off at around the same time, they proceed in lock-step to check
     # for the availability of the lock. By introducing some "jitter" we can
@@ -1059,7 +1059,7 @@ cdef _python_to_sqlite(sqlite3_context *context, value):
     return SQLITE_OK
 
 
-cdef int _commit_callback(void *userData) with gil:
+cdef int _commit_callback(void *userData) noexcept with gil:
     # C-callback that delegates to the Python commit handler. If the Python
     # function raises a ValueError, then the commit is aborted and the
     # transaction rolled back. Otherwise, regardless of the function return
@@ -1073,14 +1073,14 @@ cdef int _commit_callback(void *userData) with gil:
         return SQLITE_OK
 
 
-cdef void _rollback_callback(void *userData) with gil:
+cdef void _rollback_callback(void *userData) noexcept with gil:
     # C-callback that delegates to the Python rollback handler.
     cdef object fn = <object>userData
     fn()
 
 
 cdef void _update_callback(void *userData, int queryType, char *database,
-                            char *table, sqlite3_int64 rowid) with gil:
+                            char *table, sqlite3_int64 rowid) noexcept with gil:
     # C-callback that delegates to a Python function that is executed whenever
     # the database is updated (insert/update/delete queries). The Python
     # callback receives a string indicating the query type, the name of the
