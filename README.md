@@ -217,6 +217,6 @@ for row in query.execute(db):
 ```
 
 Unlike an ORM, the query builder has no opinions on your data-model, nor does
-it encourage inefficiency (e.g. the [n+1 problem](http://docs.peewee-orm.com/en/latest/peewee/querying.html#avoiding-n-1-queries)).
+it encourage inefficiency (e.g. the [n+1 problem](http://docs.peewee-orm.com/en/latest/peewee/relationships.html#avoiding-the-n-1-problem)).
 The query builder can be integrated into an already-running system with hardly
 any code needing to be written.
